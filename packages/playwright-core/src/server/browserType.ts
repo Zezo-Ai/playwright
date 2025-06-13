@@ -49,22 +49,6 @@ import type * as channels from '@protocol/channels';
 export const kNoXServerRunningError = 'Looks like you launched a headed browser without having a XServer running.\n' +
   'Set either \'headless: true\' or use \'xvfb-run <your-playwright-app>\' before running Playwright.\n\n<3 Playwright Team';
 
-
-export abstract class BrowserReadyState {
-  protected readonly _wsEndpoint = new ManualPromise<string|undefined>();
-
-  onBrowserExit(): void {
-    // Unblock launch when browser prematurely exits.
-    this._wsEndpoint.resolve(undefined);
-  }
-  async waitUntilReady(): Promise<{ wsEndpoint?: string }> {
-    const wsEndpoint = await this._wsEndpoint;
-    return { wsEndpoint };
-  }
-
-  abstract onBrowserOutput(message: string): void;
-}
-
 export abstract class BrowserType extends SdkObject {
   private _name: BrowserName;
 
@@ -72,6 +56,7 @@ export abstract class BrowserType extends SdkObject {
     super(parent, 'browser-type');
     this.attribution.browserType = this;
     this._name = browserName;
+    this.logName = 'browser';
   }
 
   executablePath(): string {
@@ -85,7 +70,6 @@ export abstract class BrowserType extends SdkObject {
   async launch(metadata: CallMetadata, options: types.LaunchOptions, protocolLogger?: types.ProtocolLogger): Promise<Browser> {
     options = this._validateLaunchOptions(options);
     const controller = new ProgressController(metadata, this);
-    controller.setLogName('browser');
     const browser = await controller.run(progress => {
       const seleniumHubUrl = (options as any).__testHookSeleniumRemoteURL || process.env.SELENIUM_REMOTE_URL;
       if (seleniumHubUrl)
@@ -98,7 +82,6 @@ export abstract class BrowserType extends SdkObject {
   async launchPersistentContext(metadata: CallMetadata, userDataDir: string, options: channels.BrowserTypeLaunchPersistentContextOptions & { timeout: number, cdpPort?: number, internalIgnoreHTTPSErrors?: boolean }): Promise<BrowserContext> {
     const launchOptions = this._validateLaunchOptions(options);
     const controller = new ProgressController(metadata, this);
-    controller.setLogName('browser');
     const browser = await controller.run(async progress => {
       // Note: Any initial TLS requests will fail since we rely on the Page/Frames initialize which sets ignoreHTTPSErrors.
       let clientCertificatesProxy: ClientCertificatesProxy | undefined;
@@ -216,11 +199,11 @@ export abstract class BrowserType extends SdkObject {
       await registry.validateHostRequirementsForExecutablesIfNeeded([registryExecutable], this.attribution.playwright.options.sdkLanguage);
     }
 
-    const readyState = this.readyState(options);
     // Note: it is important to define these variables before launchProcess, so that we don't get
     // "Cannot access 'browserServer' before initialization" if something went wrong.
     let transport: ConnectionTransport | undefined = undefined;
     let browserProcess: BrowserProcess | undefined = undefined;
+    const exitPromise = new ManualPromise();
     const { launchedProcess, gracefullyClose, kill } = await launchProcess({
       command: executable,
       args: browserArguments,
@@ -229,7 +212,6 @@ export abstract class BrowserType extends SdkObject {
       handleSIGTERM,
       handleSIGHUP,
       log: (message: string) => {
-        readyState?.onBrowserOutput(message);
         progress.log(message);
         browserLogsCollector.log(message);
       },
@@ -245,11 +227,12 @@ export abstract class BrowserType extends SdkObject {
       },
       onExit: (exitCode, signal) => {
         // Unblock launch when browser prematurely exits.
-        readyState?.onBrowserExit();
+        exitPromise.resolve();
         if (browserProcess && browserProcess.onclose)
           browserProcess.onclose(exitCode, signal);
       },
     });
+
     async function closeOrKill(timeout: number): Promise<void> {
       let timer: NodeJS.Timeout;
       try {
@@ -270,7 +253,10 @@ export abstract class BrowserType extends SdkObject {
       kill
     };
     progress.cleanupWhenAborted(() => closeOrKill(progress.timeUntilDeadline()));
-    const wsEndpoint = (await readyState?.waitUntilReady())?.wsEndpoint;
+    const { wsEndpoint } = await Promise.race([
+      this.waitForReadyState(options, browserLogsCollector),
+      exitPromise.then(() => ({ wsEndpoint: undefined })),
+    ]);
     if (options.cdpPort !== undefined || !this.supportsPipeTransport()) {
       transport = await WebSocketTransport.connect(progress, wsEndpoint!);
     } else {
@@ -326,8 +312,8 @@ export abstract class BrowserType extends SdkObject {
     return this.doRewriteStartupLog(error);
   }
 
-  readyState(options: types.LaunchOptions): BrowserReadyState|undefined {
-    return undefined;
+  async waitForReadyState(options: types.LaunchOptions, browserLogsCollector: RecentLogsCollector): Promise<{ wsEndpoint?: string }> {
+    return {};
   }
 
   async prepareUserDataDir(options: types.LaunchOptions, userDataDir: string): Promise<void> {

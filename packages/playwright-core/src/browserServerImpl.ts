@@ -20,14 +20,17 @@ import { helper } from './server/helper';
 import { serverSideCallMetadata } from './server/instrumentation';
 import { createPlaywright } from './server/playwright';
 import { createGuid } from './server/utils/crypto';
+import { isUnderTest } from './server/utils/debug';
 import { rewriteErrorMessage } from './utils/isomorphic/stackTrace';
 import { DEFAULT_PLAYWRIGHT_LAUNCH_TIMEOUT } from './utils/isomorphic/time';
 import { ws } from './utilsBundle';
+import * as validatorPrimitives from './protocol/validatorPrimitives';
 
 import type { BrowserServer, BrowserServerLauncher } from './client/browserType';
 import type { LaunchServerOptions, Logger, Env } from './client/types';
 import type { ProtocolLogger } from './server/types';
 import type { WebSocketEventEmitter } from './utilsBundle';
+import type { Browser } from './server/browser';
 
 export class BrowserServerLauncherImpl implements BrowserServerLauncher {
   private _browserName: 'chromium' | 'firefox' | 'webkit' | 'bidiFirefox' | 'bidiChromium';
@@ -36,7 +39,7 @@ export class BrowserServerLauncherImpl implements BrowserServerLauncher {
     this._browserName = browserName;
   }
 
-  async launchServer(options: LaunchServerOptions & { _sharedBrowser?: boolean } = {}): Promise<BrowserServer> {
+  async launchServer(options: LaunchServerOptions & { _sharedBrowser?: boolean, _userDataDir?: string } = {}): Promise<BrowserServer> {
     const playwright = createPlaywright({ sdkLanguage: 'javascript', isServer: true });
     // TODO: enable socks proxy once ipv6 is supported.
     const socksProxy = false ? new SocksProxy() : undefined;
@@ -44,17 +47,38 @@ export class BrowserServerLauncherImpl implements BrowserServerLauncher {
 
     // 1. Pre-launch the browser
     const metadata = serverSideCallMetadata();
-    const browser = await playwright[this._browserName].launch(metadata, {
+    const validatorContext = {
+      tChannelImpl: (names: '*' | string[], arg: any, path: string) => {
+        throw new validatorPrimitives.ValidationError(`${path}: channels are not expected in launchServer`);
+      },
+      binary: 'buffer',
+      isUnderTest,
+    } satisfies validatorPrimitives.ValidatorContext;
+    let launchOptions = {
       ...options,
       ignoreDefaultArgs: Array.isArray(options.ignoreDefaultArgs) ? options.ignoreDefaultArgs : undefined,
       ignoreAllDefaultArgs: !!options.ignoreDefaultArgs && !Array.isArray(options.ignoreDefaultArgs),
       env: options.env ? envObjectToArray(options.env) : undefined,
       timeout: options.timeout ?? DEFAULT_PLAYWRIGHT_LAUNCH_TIMEOUT,
-    }, toProtocolLogger(options.logger)).catch(e => {
+    };
+
+    let browser: Browser;
+    try {
+      if (options._userDataDir !== undefined) {
+        const validator = validatorPrimitives.scheme['BrowserTypeLaunchPersistentContextParams'];
+        launchOptions = validator({ ...launchOptions, userDataDir: options._userDataDir }, '', validatorContext);
+        const context = await playwright[this._browserName].launchPersistentContext(metadata, options._userDataDir, launchOptions);
+        browser = context._browser;
+      } else {
+        const validator = validatorPrimitives.scheme['BrowserTypeLaunchParams'];
+        launchOptions = validator(launchOptions, '', validatorContext);
+        browser = await playwright[this._browserName].launch(metadata, launchOptions, toProtocolLogger(options.logger));
+      }
+    } catch (e) {
       const log = helper.formatBrowserLogs(metadata.log);
       rewriteErrorMessage(e, `${e.message} Failed to launch browser.${log}`);
       throw e;
-    });
+    }
 
     const path = options.wsPath ? (options.wsPath.startsWith('/') ? options.wsPath : `/${options.wsPath}`) : `/${createGuid()}`;
 

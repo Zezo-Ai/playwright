@@ -36,13 +36,14 @@ import { RecorderApp } from './recorder/recorderApp';
 import { Selectors } from './selectors';
 import { Tracing } from './trace/recorder/tracing';
 import * as rawStorageSource from '../generated/storageScriptSource';
+import { ProgressController } from './progress';
 
 import type { Artifact } from './artifact';
 import type { Browser, BrowserOptions } from './browser';
 import type { Download } from './download';
 import type * as frames from './frames';
 import type { CallMetadata } from './instrumentation';
-import type { Progress, ProgressController } from './progress';
+import type { Progress } from './progress';
 import type { ClientCertificatesProxy } from './socksClientCertificatesInterceptor';
 import type { SerializedStorage } from '@injected/storageScript';
 import type * as types from './types';
@@ -70,7 +71,7 @@ export abstract class BrowserContext extends SdkObject {
   readonly _pageBindings = new Map<string, PageBinding>();
   readonly _activeProgressControllers = new Set<ProgressController>();
   readonly _options: types.BrowserContextOptions;
-  _requestInterceptor?: network.RouteHandler;
+  readonly requestInterceptors: network.RouteHandler[] = [];
   private _isPersistentContext: boolean;
   private _closedStatus: 'open' | 'closing' | 'closed' = 'open';
   readonly _closePromise: Promise<Error>;
@@ -191,6 +192,11 @@ export abstract class BrowserContext extends SdkObject {
   }
 
   async resetForReuse(metadata: CallMetadata, params: channels.BrowserNewContextForReuseParams | null) {
+    const controller = new ProgressController(metadata, this);
+    return controller.run(progress => this.resetForReuseImpl(progress, params));
+  }
+
+  async resetForReuseImpl(progress: Progress, params: channels.BrowserNewContextForReuseParams | null) {
     await this.tracing.resetForReuse();
 
     if (params) {
@@ -200,20 +206,18 @@ export abstract class BrowserContext extends SdkObject {
         this.selectors().setTestIdAttributeName(params.testIdAttributeName);
     }
 
-    await this._cancelAllRoutesInFlight();
-
     // Close extra pages early.
     let page: Page | undefined = this.pages()[0];
     const [, ...otherPages] = this.pages();
     for (const p of otherPages)
-      await p.close(metadata);
+      await p.close();
     if (page && page.hasCrashed()) {
-      await page.close(metadata);
+      await page.close();
       page = undefined;
     }
 
     // Navigate to about:blank first to ensure no page scripts are running after this point.
-    await page?.mainFrame().goto(metadata, 'about:blank', { timeout: 0 });
+    await page?.mainFrame().gotoImpl(progress, 'about:blank', {});
 
     await this._resetStorage();
     await this.clock.resetForReuse();
@@ -229,7 +233,7 @@ export abstract class BrowserContext extends SdkObject {
     await this.clearCache();
     await this._resetCookies();
 
-    await page?.resetForReuse(metadata);
+    await page?.resetForReuse(progress);
   }
 
   _browserClosed() {
@@ -400,7 +404,7 @@ export abstract class BrowserContext extends SdkObject {
       // - chromium fails to change isMobile for existing page;
       // - webkit fails to change locale for existing page.
       await this.newPage(progress.metadata);
-      await defaultPage.close(progress.metadata);
+      await defaultPage.close();
     }
   }
 
@@ -439,8 +443,17 @@ export abstract class BrowserContext extends SdkObject {
     await this.doRemoveInitScripts(initScripts);
   }
 
-  async setRequestInterceptor(handler: network.RouteHandler | undefined): Promise<void> {
-    this._requestInterceptor = handler;
+  async addRequestInterceptor(handler: network.RouteHandler): Promise<void> {
+    this.requestInterceptors.push(handler);
+    await this.doUpdateRequestInterception();
+  }
+
+  async removeRequestInterceptor(handler: network.RouteHandler): Promise<void> {
+    const index = this.requestInterceptors.indexOf(handler);
+    if (index === -1)
+      return;
+    this.requestInterceptors.splice(index, 1);
+    await this.notifyRoutesInFlightAboutRemovedHandler(handler);
     await this.doUpdateRequestInterception();
   }
 
@@ -547,10 +560,9 @@ export abstract class BrowserContext extends SdkObject {
     if (originsToSave.size)  {
       const internalMetadata = serverSideCallMetadata();
       const page = await this.newPage(internalMetadata);
-      await page.setServerRequestInterceptor(handler => {
-        handler.fulfill({ body: '<html></html>' }).catch(() => {});
-        return true;
-      });
+      page.addRequestInterceptor(route => {
+        route.fulfill({ body: '<html></html>' }).catch(() => {});
+      }, 'prepend');
       for (const origin of originsToSave) {
         const frame = page.mainFrame();
         await frame.goto(internalMetadata, origin, { timeout: 0 });
@@ -558,7 +570,7 @@ export abstract class BrowserContext extends SdkObject {
         if (storage.localStorage.length || storage.indexedDB?.length)
           result.origins.push({ origin, localStorage: storage.localStorage, indexedDB: storage.indexedDB });
       }
-      await page.close(internalMetadata);
+      await page.close();
     }
     return result;
   }
@@ -577,10 +589,10 @@ export abstract class BrowserContext extends SdkObject {
       // as a user-visible page.
       isServerSide: false,
     });
-    await page.setServerRequestInterceptor(handler => {
-      handler.fulfill({ body: '<html></html>' }).catch(() => {});
-      return true;
-    });
+    const interceptor = (route: network.Route) => {
+      route.fulfill({ body: '<html></html>' }).catch(() => {});
+    };
+    await page.addRequestInterceptor(interceptor, 'prepend');
 
     for (const origin of new Set([...oldOrigins, ...newOrigins.keys()])) {
       const frame = page.mainFrame();
@@ -588,7 +600,7 @@ export abstract class BrowserContext extends SdkObject {
       await frame.resetStorageForCurrentOriginBestEffort(newOrigins.get(origin));
     }
 
-    await page.setServerRequestInterceptor(undefined);
+    await page.removeRequestInterceptor(interceptor);
 
     this._origins = new Set([...newOrigins.keys()]);
     // It is safe to not restore the URL to about:blank since we are doing it in Page::resetForReuse.
@@ -612,10 +624,9 @@ export abstract class BrowserContext extends SdkObject {
       if (state.origins && state.origins.length)  {
         const internalMetadata = serverSideCallMetadata();
         const page = await this.newPage(internalMetadata);
-        await page.setServerRequestInterceptor(handler => {
-          handler.fulfill({ body: '<html></html>' }).catch(() => {});
-          return true;
-        });
+        await page.addRequestInterceptor(route => {
+          route.fulfill({ body: '<html></html>' }).catch(() => {});
+        }, 'prepend');
         for (const originState of state.origins) {
           const frame = page.mainFrame();
           await frame.goto(metadata, originState.origin, { timeout: 0 });
@@ -627,7 +638,7 @@ export abstract class BrowserContext extends SdkObject {
           })()`;
           await frame.evaluateExpression(restoreScript, { world: 'utility' });
         }
-        await page.close(internalMetadata);
+        await page.close();
       }
     } finally {
       this._settingStorageState = false;
@@ -667,9 +678,8 @@ export abstract class BrowserContext extends SdkObject {
     this._routesInFlight.delete(route);
   }
 
-  async _cancelAllRoutesInFlight() {
-    await Promise.all([...this._routesInFlight].map(r => r.abort())).catch(() => {});
-    this._routesInFlight.clear();
+  async notifyRoutesInFlightAboutRemovedHandler(handler: network.RouteHandler): Promise<void> {
+    await Promise.all([...this._routesInFlight].map(route => route.removeHandler(handler)));
   }
 }
 

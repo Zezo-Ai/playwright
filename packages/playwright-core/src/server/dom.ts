@@ -24,7 +24,7 @@ import { isSessionClosedError } from './protocolError';
 import * as rawInjectedScriptSource from '../generated/injectedScriptSource';
 
 import type * as frames from './frames';
-import type { ElementState, HitTargetInterceptionResult, InjectedScript, InjectedScriptOptions } from '@injected/injectedScript';
+import type { ElementState, HitTargetError, HitTargetInterceptionResult, InjectedScript, InjectedScriptOptions } from '@injected/injectedScript';
 import type { CallMetadata } from './instrumentation';
 import type { Page } from './page';
 import type { Progress } from './progress';
@@ -39,7 +39,7 @@ export type InputFilesItems = {
 };
 
 type ActionName = 'click' | 'hover' | 'dblclick' | 'tap' | 'move and up' | 'move and down';
-type PerformActionResult = 'error:notvisible' | 'error:notconnected' | 'error:notinviewport' | 'error:optionsnotfound' | { missingState: ElementState } | { hitTargetDescription: string } | 'done';
+type PerformActionResult = 'error:notvisible' | 'error:notconnected' | 'error:notinviewport' | 'error:optionsnotfound' | { missingState: ElementState } | HitTargetError | 'done';
 
 export class NonRecoverableDOMError extends Error {
 }
@@ -86,7 +86,7 @@ export class FrameExecutionContext extends js.ExecutionContext {
       const customEngines: InjectedScriptOptions['customEngines'] = [];
       const selectorsRegistry = this.frame._page.browserContext.selectors();
       for (const [name, { source }] of selectorsRegistry._engines)
-        customEngines.push({ name, source });
+        customEngines.push({ name, source: `(${source})` });
       const sdkLanguage = this.frame.attribution.playwright.options.sdkLanguage;
       const options: InjectedScriptOptions = {
         isUnderTest: isUnderTest(),
@@ -94,7 +94,6 @@ export class FrameExecutionContext extends js.ExecutionContext {
         testIdAttributeName: selectorsRegistry.testIdAttributeName(),
         stableRafCount: this.frame._page.delegate.rafCountForStablePosition(),
         browserName: this.frame._page.browserContext._browser.options.name,
-        inputFileRoleTextbox: process.env.PLAYWRIGHT_INPUT_FILE_TEXTBOX ? true : false,
         customEngines,
       };
       const source = `
@@ -332,7 +331,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     };
   }
 
-  async _retryAction(progress: Progress, actionName: string, action: (retry: number) => Promise<PerformActionResult>, options: { trial?: boolean, force?: boolean, skipActionPreChecks?: boolean }): Promise<'error:notconnected' | 'done'> {
+  async _retryAction(progress: Progress, actionName: string, action: () => Promise<PerformActionResult>, options: { trial?: boolean, force?: boolean, skipActionPreChecks?: boolean }): Promise<'error:notconnected' | 'done'> {
     let retry = 0;
     // We progressively wait longer between retries, up to 500ms.
     const waitTime = [0, 20, 100, 100, 500];
@@ -352,7 +351,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       }
       if (!options.skipActionPreChecks && !options.force)
         await this._frame._page.performActionPreChecks(progress);
-      const result = await action(retry);
+      const result = await action();
       ++retry;
       if (result === 'error:notvisible') {
         if (options.force)
@@ -387,19 +386,25 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     options: { waitAfter: boolean | 'disabled' } & types.PointerActionOptions & types.PointerActionWaitOptions): Promise<'error:notconnected' | 'done'> {
     // Note: do not perform locator handlers checkpoint to avoid moving the mouse in the middle of a drag operation.
     const skipActionPreChecks = actionName === 'move and up';
-    return await this._retryAction(progress, actionName, async retry => {
-      // By default, we scroll with protocol method to reveal the action point.
-      // However, that might not work to scroll from under position:sticky elements
-      // that overlay the target element. To fight this, we cycle through different
-      // scroll alignments. This works in most scenarios.
-      const scrollOptions: (ScrollIntoViewOptions | undefined)[] = [
-        undefined,
-        { block: 'end', inline: 'end' },
-        { block: 'center', inline: 'center' },
-        { block: 'start', inline: 'start' },
-      ];
-      const forceScrollOptions = scrollOptions[retry % scrollOptions.length];
-      return await this._performPointerAction(progress, actionName, waitForEnabled, action, forceScrollOptions, options);
+    // By default, we scroll with protocol method to reveal the action point.
+    // However, that might not work to scroll from under position:sticky and position:fixed elements
+    // that overlay the target element. To fight this, we cycle through different
+    // scroll alignments. This works in most scenarios.
+    const scrollOptions: (ScrollIntoViewOptions | undefined)[] = [
+      undefined,
+      { block: 'end', inline: 'end' },
+      { block: 'center', inline: 'center' },
+      { block: 'start', inline: 'start' },
+    ];
+    let scrollOptionIndex = 0;
+    return await this._retryAction(progress, actionName, async () => {
+      const forceScrollOptions = scrollOptions[scrollOptionIndex % scrollOptions.length];
+      const result = await this._performPointerAction(progress, actionName, waitForEnabled, action, forceScrollOptions, options);
+      if (typeof result === 'object' && 'hasPositionStickyOrFixed' in result && result.hasPositionStickyOrFixed)
+        ++scrollOptionIndex;
+      else
+        scrollOptionIndex = 0;
+      return result;
     }, { ...options, skipActionPreChecks });
   }
 
@@ -482,7 +487,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
         const error = handle.rawValue() as string;
         if (error === 'error:notconnected')
           return error;
-        return { hitTargetDescription: error };
+        return JSON.parse(error) as HitTargetError; // It is safe to parse, because we evaluated in utility.
       }
       hitTargetInterceptionHandle = handle as any;
       progress.cleanupWhenAborted(() => {
@@ -499,11 +504,11 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       progress.throwIfAborted();  // Avoid action that has side-effects.
       let restoreModifiers: types.KeyboardModifier[] | undefined;
       if (options && options.modifiers)
-        restoreModifiers = await this._page.keyboard.ensureModifiers(options.modifiers);
+        restoreModifiers = await this._page.keyboard.ensureModifiers(progress, options.modifiers);
       progress.log(`  performing ${actionName} action`);
       await action(point);
       if (restoreModifiers)
-        await this._page.keyboard.ensureModifiers(restoreModifiers);
+        await this._page.keyboard.ensureModifiers(progress, restoreModifiers);
       if (hitTargetInterceptionHandle) {
         const stopHitTargetInterception = this._frame.raceAgainstEvaluationStallingEvents(() => {
           return hitTargetInterceptionHandle.evaluate(h => h.stop());
@@ -549,7 +554,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   _hover(progress: Progress, options: types.PointerActionOptions & types.PointerActionWaitOptions): Promise<'error:notconnected' | 'done'> {
-    return this._retryPointerAction(progress, 'hover', false /* waitForEnabled */, point => this._page.mouse.move(point.x, point.y), { ...options, waitAfter: 'disabled' });
+    return this._retryPointerAction(progress, 'hover', false /* waitForEnabled */, point => this._page.mouse._move(progress, point.x, point.y), { ...options, waitAfter: 'disabled' });
   }
 
   async click(metadata: CallMetadata, options: { noWaitAfter?: boolean } & types.MouseClickOptions & types.PointerActionWaitOptions): Promise<void> {
@@ -562,7 +567,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   _click(progress: Progress, options: { waitAfter: boolean | 'disabled' } & types.MouseClickOptions & types.PointerActionWaitOptions): Promise<'error:notconnected' | 'done'> {
-    return this._retryPointerAction(progress, 'click', true /* waitForEnabled */, point => this._page.mouse.click(point.x, point.y, options), options);
+    return this._retryPointerAction(progress, 'click', true /* waitForEnabled */, point => this._page.mouse._click(progress, point.x, point.y, options), options);
   }
 
   async dblclick(metadata: CallMetadata, options: types.MouseMultiClickOptions & types.PointerActionWaitOptions): Promise<void> {
@@ -575,7 +580,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   _dblclick(progress: Progress, options: types.MouseMultiClickOptions & types.PointerActionWaitOptions): Promise<'error:notconnected' | 'done'> {
-    return this._retryPointerAction(progress, 'dblclick', true /* waitForEnabled */, point => this._page.mouse.dblclick(point.x, point.y, options), { ...options, waitAfter: 'disabled' });
+    return this._retryPointerAction(progress, 'dblclick', true /* waitForEnabled */, point => this._page.mouse._click(progress, point.x, point.y, { ...options, clickCount: 2 }), { ...options, waitAfter: 'disabled' });
   }
 
   async tap(metadata: CallMetadata, options: types.PointerActionWaitOptions): Promise<void> {
@@ -588,7 +593,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
   }
 
   _tap(progress: Progress, options: types.PointerActionWaitOptions): Promise<'error:notconnected' | 'done'> {
-    return this._retryPointerAction(progress, 'tap', true /* waitForEnabled */, point => this._page.touchscreen.tap(point.x, point.y), { ...options, waitAfter: 'disabled' });
+    return this._retryPointerAction(progress, 'tap', true /* waitForEnabled */, point => this._page.touchscreen._tap(progress, point.x, point.y), { ...options, waitAfter: 'disabled' });
   }
 
   async selectOption(metadata: CallMetadata, elements: ElementHandle[], values: types.SelectOption[], options: types.CommonActionOptions): Promise<string[]> {
@@ -653,9 +658,9 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       progress.throwIfAborted();  // Avoid action that has side-effects.
       if (result === 'needsinput') {
         if (value)
-          await this._page.keyboard.insertText(value);
+          await this._page.keyboard._insertText(progress, value);
         else
-          await this._page.keyboard.press('Delete');
+          await this._page.keyboard._press(progress, 'Delete');
         return 'done';
       } else {
         return result;
@@ -768,7 +773,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     if (result !== 'done')
       return result;
     progress.throwIfAborted();  // Avoid action that has side-effects.
-    await this._page.keyboard.type(text, options);
+    await this._page.keyboard._type(progress, text, options);
     return 'done';
   }
 
@@ -789,7 +794,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       if (result !== 'done')
         return result;
       progress.throwIfAborted();  // Avoid action that has side-effects.
-      await this._page.keyboard.press(key, options);
+      await this._page.keyboard._press(progress, key, options);
       return 'done';
     });
   }
@@ -911,7 +916,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this;
   }
 
-  async _checkFrameIsHitTarget(point: types.Point): Promise<{ framePoint: types.Point | undefined } | 'error:notconnected' | { hitTargetDescription: string }> {
+  async _checkFrameIsHitTarget(point: types.Point): Promise<{ framePoint: types.Point | undefined } | 'error:notconnected' | HitTargetError> {
     let frame = this._frame;
     const data: { frame: frames.Frame, frameElement: ElementHandle<Element> | null, pointInFrame: types.Point }[] = [];
     while (frame.parentFrame()) {

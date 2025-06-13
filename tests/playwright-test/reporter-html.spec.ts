@@ -801,7 +801,7 @@ for (const useIntermediateMergeReport of [true, false] as const) {
 
       await showReport();
       await page.getByRole('link', { name: 'example' }).click();
-      await page.click('text=Step "skipped step title" (skipped)');
+      await page.click('text=skipped step title (skipped)');
       await expect(page.getByTestId('test-snippet')).toContainText(`await test.step.skip('skipped step title', async () => {`);
     });
 
@@ -826,7 +826,7 @@ for (const useIntermediateMergeReport of [true, false] as const) {
 
       await showReport();
       await page.getByRole('link', { name: 'example' }).click();
-      await page.click('text=Step "step title" (skipped: conditional step.skip)');
+      await page.click('text=step title (skipped: conditional step.skip)');
       await expect(page.getByTestId('test-snippet')).toContainText(`await test.step('step title', async (step) => {`);
     });
 
@@ -1875,6 +1875,7 @@ for (const useIntermediateMergeReport of [true, false] as const) {
         const smokeLabelButton = page.locator('.test-file-test', { has: page.getByText('@smoke fails', { exact: true }) }).locator('.label', { hasText: 'smoke' });
         await smokeLabelButton.click();
         await expect(page).toHaveURL(/@smoke/);
+        await expect(searchInput).toHaveValue('@smoke ');
         await searchInput.clear();
         await page.keyboard.press('Enter');
         await expect(searchInput).toHaveValue('');
@@ -1883,6 +1884,7 @@ for (const useIntermediateMergeReport of [true, false] as const) {
         const regressionLabelButton = page.locator('.test-file-test', { has: page.getByText('@regression passes', { exact: true }) }).locator('.label', { hasText: 'regression' });
         await regressionLabelButton.click();
         await expect(page).toHaveURL(/@regression/);
+        await expect(searchInput).toHaveValue('@regression ');
         await searchInput.clear();
         await page.keyboard.press('Enter');
         await expect(searchInput).toHaveValue('');
@@ -2874,7 +2876,7 @@ for (const useIntermediateMergeReport of [true, false] as const) {
       await expect(page.locator('.tree-item', { hasText: 'stdout' })).toHaveCount(1);
     });
 
-    test.fixme('should include diff in AI prompt', async ({ runInlineTest, writeFiles, showReport, page }) => {
+    test('should include diff in AI prompt', async ({ runInlineTest, writeFiles, showReport, page }) => {
       const files = {
         'uncommitted.txt': `uncommitted file`,
         'playwright.config.ts': `export default {}`,

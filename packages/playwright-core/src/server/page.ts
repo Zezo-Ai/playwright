@@ -94,7 +94,7 @@ export interface PageDelegate {
   // Work around for asynchronously dispatched CSP errors in Firefox.
   readonly cspErrorsAsynchronousForInlineScripts?: boolean;
   // Work around for mouse position in Firefox.
-  resetForReuse(): Promise<void>;
+  resetForReuse(progress: Progress): Promise<void>;
   // WebKit hack.
   shouldToggleStyleSheetToSyncAnimations(): boolean;
 }
@@ -151,7 +151,7 @@ export class Page extends SdkObject {
   private _emulatedSize: EmulatedSize | undefined;
   private _extraHTTPHeaders: types.HeadersArray | undefined;
   private _emulatedMedia: Partial<EmulatedMedia> = {};
-  private _interceptFileChooser = false;
+  private _fileChooserInterceptedBy = new Set<any>();
   private readonly _pageBindings = new Map<string, PageBinding>();
   initScripts: InitScript[] = [];
   readonly screenshotter: Screenshotter;
@@ -160,8 +160,7 @@ export class Page extends SdkObject {
   private _workers = new Map<string, Worker>();
   readonly pdf: ((options: channels.PagePdfParams) => Promise<Buffer>) | undefined;
   readonly coverage: any;
-  clientRequestInterceptor: network.RouteHandler | undefined;
-  serverRequestInterceptor: network.RouteHandler | undefined;
+  readonly requestInterceptors: network.RouteHandler[] = [];
   video: Artifact | null = null;
   private _opener: Page | undefined;
   private _isServerSideOnly = false;
@@ -181,7 +180,7 @@ export class Page extends SdkObject {
     this.delegate = delegate;
     this.browserContext = browserContext;
     this.accessibility = new accessibility.Accessibility(delegate.getAccessibilityTree.bind(delegate));
-    this.keyboard = new input.Keyboard(delegate.rawKeyboard);
+    this.keyboard = new input.Keyboard(delegate.rawKeyboard, this);
     this.mouse = new input.Mouse(delegate.rawMouse, this);
     this.touchscreen = new input.Touchscreen(delegate.rawTouchscreen, this);
     this.screenshotter = new Screenshotter(this);
@@ -255,27 +254,22 @@ export class Page extends SdkObject {
       this._eventsToEmitAfterInitialized.push({ event, args });
   }
 
-  async resetForReuse(metadata: CallMetadata) {
+  async resetForReuse(progress: Progress) {
     this._locatorHandlers.clear();
 
-    await this.setClientRequestInterceptor(undefined);
-    await this.setServerRequestInterceptor(undefined);
-    await this.setFileChooserIntercepted(false);
     // Re-navigate once init scripts are gone.
     // TODO: we should have a timeout for `resetForReuse`.
-    await this.mainFrame().goto(metadata, 'about:blank', { timeout: 0 });
+    await this.mainFrame().gotoImpl(progress, 'about:blank', {});
     this._emulatedSize = undefined;
     this._emulatedMedia = {};
     this._extraHTTPHeaders = undefined;
-    this._interceptFileChooser = false;
 
     await Promise.all([
       this.delegate.updateEmulatedViewportSize(),
       this.delegate.updateEmulateMedia(),
-      this.delegate.updateFileChooserInterception(),
     ]);
 
-    await this.delegate.resetForReuse();
+    await this.delegate.resetForReuse(progress);
   }
 
   _didClose() {
@@ -461,8 +455,6 @@ export class Page extends SdkObject {
   }
 
   private async _performWaitForNavigationCheck(progress: Progress) {
-    if (process.env.PLAYWRIGHT_SKIP_NAVIGATION_CHECK)
-      return;
     const mainFrame = this.frameManager.mainFrame();
     if (!mainFrame || !mainFrame.pendingDocument())
       return;
@@ -574,16 +566,23 @@ export class Page extends SdkObject {
   }
 
   needsRequestInterception(): boolean {
-    return !!this.clientRequestInterceptor || !!this.serverRequestInterceptor || !!this.browserContext._requestInterceptor;
+    return this.requestInterceptors.length > 0 || this.browserContext.requestInterceptors.length > 0;
   }
 
-  async setClientRequestInterceptor(handler: network.RouteHandler | undefined): Promise<void> {
-    this.clientRequestInterceptor = handler;
+  async addRequestInterceptor(handler: network.RouteHandler, prepend?: 'prepend'): Promise<void> {
+    if (prepend)
+      this.requestInterceptors.unshift(handler);
+    else
+      this.requestInterceptors.push(handler);
     await this.delegate.updateRequestInterception();
   }
 
-  async setServerRequestInterceptor(handler: network.RouteHandler | undefined): Promise<void> {
-    this.serverRequestInterceptor = handler;
+  async removeRequestInterceptor(handler: network.RouteHandler): Promise<void> {
+    const index = this.requestInterceptors.indexOf(handler);
+    if (index === -1)
+      return;
+    this.requestInterceptors.splice(index, 1);
+    await this.browserContext.notifyRoutesInFlightAboutRemovedHandler(handler);
     await this.delegate.updateRequestInterception();
   }
 
@@ -696,7 +695,7 @@ export class Page extends SdkObject {
         options.timeout);
   }
 
-  async close(metadata: CallMetadata, options: { runBeforeUnload?: boolean, reason?: string } = {}) {
+  async close(options: { runBeforeUnload?: boolean, reason?: string } = {}) {
     if (this._closedState === 'closed')
       return;
     if (options.reason)
@@ -744,13 +743,18 @@ export class Page extends SdkObject {
     }
   }
 
-  async setFileChooserIntercepted(enabled: boolean): Promise<void> {
-    this._interceptFileChooser = enabled;
-    await this.delegate.updateFileChooserInterception();
+  async setFileChooserInterceptedBy(enabled: boolean, by: any): Promise<void> {
+    const wasIntercepted = this.fileChooserIntercepted();
+    if (enabled)
+      this._fileChooserInterceptedBy.add(by);
+    else
+      this._fileChooserInterceptedBy.delete(by);
+    if (wasIntercepted !== this.fileChooserIntercepted())
+      await this.delegate.updateFileChooserInterception();
   }
 
   fileChooserIntercepted() {
-    return this._interceptFileChooser;
+    return this._fileChooserInterceptedBy.size > 0;
   }
 
   frameNavigatedToNewDocument(frame: frames.Frame) {
@@ -806,7 +810,7 @@ export class Page extends SdkObject {
 
   async snapshotForAI(metadata: CallMetadata): Promise<string> {
     this.lastSnapshotFrameIds = [];
-    const snapshot = await snapshotFrameForAI(this.mainFrame(), 0, this.lastSnapshotFrameIds);
+    const snapshot = await snapshotFrameForAI(metadata, this.mainFrame(), 0, this.lastSnapshotFrameIds);
     return snapshot.join('\n');
   }
 }
@@ -908,7 +912,6 @@ export class PageBinding {
 export class InitScript {
   readonly source: string;
   readonly name?: string;
-  auxData: any; // Can be arbitrarily used by a browser-specific implementation.
 
   constructor(source: string, name?: string) {
     this.source = `(() => {
@@ -984,12 +987,30 @@ class FrameThrottler {
   }
 }
 
-async function snapshotFrameForAI(frame: frames.Frame, frameOrdinal: number, frameIds: string[]): Promise<string[]> {
-  const context = await frame._utilityContext();
-  const injectedScript = await context.injectedScript();
-  const snapshot = await injectedScript.evaluate((injected, refPrefix) => {
-    return injected.ariaSnapshot(injected.document.body, { forAI: true, refPrefix });
-  }, frameOrdinal ? 'f' + frameOrdinal : '');
+async function snapshotFrameForAI(metadata: CallMetadata, frame: frames.Frame, frameOrdinal: number, frameIds: string[]): Promise<string[]> {
+  // Only await the topmost navigations, inner frames will be empty when racing.
+  const controller = new ProgressController(metadata, frame);
+  const snapshot = await controller.run(progress => {
+    return frame.retryWithProgressAndTimeouts(progress, [1000, 2000, 4000, 8000], async continuePolling => {
+      try {
+        const context = await frame._utilityContext();
+        const injectedScript = await context.injectedScript();
+        const snapshotOrRetry = await injectedScript.evaluate((injected, refPrefix) => {
+          const node = injected.document.body;
+          if (!node)
+            return true;
+          return injected.ariaSnapshot(node, { forAI: true, refPrefix });
+        }, frameOrdinal ? 'f' + frameOrdinal : '');
+        if (snapshotOrRetry === true)
+          return continuePolling;
+        return snapshotOrRetry;
+      } catch (e) {
+        if (js.isJavaScriptErrorInEvaluate(e))
+          throw e;
+        return continuePolling;
+      }
+    });
+  });
 
   const lines = snapshot.split('\n');
   const result = [];
@@ -1012,7 +1033,7 @@ async function snapshotFrameForAI(frame: frames.Frame, frameOrdinal: number, fra
     const frameOrdinal = frameIds.length + 1;
     frameIds.push(child.frame._id);
     try {
-      const childSnapshot = await snapshotFrameForAI(child.frame, frameOrdinal, frameIds);
+      const childSnapshot = await snapshotFrameForAI(metadata, child.frame, frameOrdinal, frameIds);
       result.push(line + ':', ...childSnapshot.map(l => leadingSpace + '  ' + l));
     } catch {
       result.push(line);
