@@ -72,7 +72,6 @@ export type InjectedScriptOptions = {
   testIdAttributeName: string;
   stableRafCount: number;
   browserName: string;
-  inputFileRoleTextbox: boolean;
   customEngines: { name: string, source: string }[];
 };
 
@@ -235,7 +234,7 @@ export class InjectedScript {
 
     this._stableRafCount = options.stableRafCount;
     this._browserName = options.browserName;
-    setGlobalOptions({ browserNameForWorkarounds: options.browserName, inputFileRoleTextbox: options.inputFileRoleTextbox });
+    setGlobalOptions({ browserNameForWorkarounds: options.browserName });
 
     this._setupGlobalListenersRemovalDetection();
     this._setupHitTargetInterceptors();
@@ -1340,6 +1339,16 @@ export class InjectedScript {
       // expect(locator).not.toBeInViewport() passes when there is no element.
       if (options.isNot && options.expression === 'to.be.in.viewport')
         return { matches: false };
+      if (options.expression === 'to.have.title' && options?.expectedText?.[0]) {
+        const matcher = new ExpectedTextMatcher(options.expectedText[0]);
+        const received = this.document.title;
+        return { received, matches: matcher.matches(received) };
+      }
+      if (options.expression === 'to.have.url' && options?.expectedText?.[0]) {
+        const matcher = new ExpectedTextMatcher(options.expectedText[0]);
+        const received = this.document.location.href;
+        return { received, matches: matcher.matches(received) };
+      }
       // When none of the above applies, expect does not match.
       return { matches: options.isNot, missingReceived: true };
     }
@@ -1489,10 +1498,6 @@ export class InjectedScript {
         received = getElementAccessibleErrorMessage(element);
       } else if (expression === 'to.have.role') {
         received = getAriaRole(element) || '';
-      } else if (expression === 'to.have.title') {
-        received = this.document.title;
-      } else if (expression === 'to.have.url') {
-        received = this.document.location.href;
       } else if (expression === 'to.have.value') {
         element = this.retarget(element, 'follow-label')!;
         if (element.nodeName !== 'INPUT' && element.nodeName !== 'TEXTAREA' && element.nodeName !== 'SELECT')

@@ -258,9 +258,7 @@ for (const kind of ['launchServer', 'run-server'] as const) {
         }).catch(() => {})
       ]);
       expect(request.headers['user-agent']).toBe(getUserAgent());
-      // _bidiFirefox and _bidiChromium are initialized with 'bidi' as browser name.
-      const bidiAwareBrowserName = browserName.startsWith('_bidi') ? 'bidi' : browserName;
-      expect(request.headers['x-playwright-browser']).toBe(bidiAwareBrowserName);
+      expect(request.headers['x-playwright-browser']).toBe(browserName);
       expect(request.headers['foo']).toBe('bar');
     });
 
@@ -1038,6 +1036,12 @@ test.describe('launchServer only', () => {
         await browser.close();
       });
     }
+  });
+
+  test('cannot launch another browser', async ({ connect, startRemoteServer }) => {
+    const remoteServer = await startRemoteServer('launchServer');
+    const browser = await connect(remoteServer.wsEndpoint()) as any;
+    await expect(browser._parent.launch({ timeout: 0 })).rejects.toThrowError('Launching more browsers is not allowed.');
   });
 });
 

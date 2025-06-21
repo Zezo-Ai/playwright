@@ -419,7 +419,6 @@ export class FFPage implements PageDelegate {
         height: viewportRect!.height,
       };
     }
-    progress.throwIfAborted();
     const { data } = await this._session.send('Page.screenshot', {
       mimeType: ('image/' + format) as ('image/png' | 'image/jpeg'),
       clip: documentRect,
@@ -545,12 +544,12 @@ export class FFPage implements PageDelegate {
   async inputActionEpilogue(): Promise<void> {
   }
 
-  async resetForReuse(): Promise<void> {
+  async resetForReuse(progress: Progress): Promise<void> {
     // Firefox sometimes keeps the last mouse position in the page,
     // which affects things like hovered state.
     // See https://github.com/microsoft/playwright/issues/22432.
     // Move mouse to (-1, -1) to avoid anything being hovered.
-    await this.rawMouse.move(-1, -1, 'none', new Set(), new Set(), false);
+    await this.rawMouse.move(progress, -1, -1, 'none', new Set(), new Set(), false);
   }
 
   async getFrameElement(frame: frames.Frame): Promise<dom.ElementHandle> {

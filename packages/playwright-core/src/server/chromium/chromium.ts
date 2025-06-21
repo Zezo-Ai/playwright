@@ -30,7 +30,6 @@ import { fetchData } from '../utils/network';
 import { getUserAgent } from '../utils/userAgent';
 import { validateBrowserContextOptions } from '../browserContext';
 import { BrowserType, kNoXServerRunningError } from '../browserType';
-import { BrowserReadyState } from '../browserType';
 import { helper } from '../helper';
 import { registry } from '../registry';
 import { WebSocketTransport } from '../transport';
@@ -64,8 +63,7 @@ export class Chromium extends BrowserType {
   }
 
   override async connectOverCDP(metadata: CallMetadata, endpointURL: string, options: { slowMo?: number, headers?: types.HeadersArray, timeout: number }) {
-    const controller = new ProgressController(metadata, this);
-    controller.setLogName('browser');
+    const controller = new ProgressController(metadata, this, 'strict');
     return controller.run(async progress => {
       return await this._connectOverCDPInternal(progress, endpointURL, options);
     }, options.timeout);
@@ -81,12 +79,11 @@ export class Chromium extends BrowserType {
     else if (headersMap && !Object.keys(headersMap).some(key => key.toLowerCase() === 'user-agent'))
       headersMap['User-Agent'] = getUserAgent();
 
-    const artifactsDir = await fs.promises.mkdtemp(ARTIFACTS_FOLDER);
+    const artifactsDir = await progress.race(fs.promises.mkdtemp(ARTIFACTS_FOLDER));
 
     const wsEndpoint = await urlToWSEndpoint(progress, endpointURL, headersMap);
-    progress.throwIfAborted();
-
     const chromeTransport = await WebSocketTransport.connect(progress, wsEndpoint, { headers: headersMap });
+    progress.cleanupWhenAborted(() => chromeTransport.close());
     const cleanedUp = new ManualPromise<void>();
     const doCleanup = async () => {
       await removeFolders([artifactsDir]);
@@ -113,8 +110,7 @@ export class Chromium extends BrowserType {
       originalLaunchOptions: { timeout: options.timeout },
     };
     validateBrowserContextOptions(persistent, browserOptions);
-    progress.throwIfAborted();
-    const browser = await CRBrowser.connect(this.attribution.playwright, chromeTransport, browserOptions);
+    const browser = await progress.race(CRBrowser.connect(this.attribution.playwright, chromeTransport, browserOptions));
     browser._isCollocatedWithServer = false;
     browser.on(Browser.Events.Disconnected, doCleanup);
     return browser;
@@ -176,7 +172,7 @@ export class Chromium extends BrowserType {
   }
 
   override async _launchWithSeleniumHub(progress: Progress, hubUrl: string, options: types.LaunchOptions): Promise<CRBrowser> {
-    await this._createArtifactDirs(options);
+    await progress.race(this._createArtifactDirs(options));
 
     if (!hubUrl.endsWith('/'))
       hubUrl = hubUrl + '/';
@@ -333,14 +329,14 @@ export class Chromium extends BrowserType {
       const proxyURL = new URL(proxy.server);
       const isSocks = proxyURL.protocol === 'socks5:';
       // https://www.chromium.org/developers/design-documents/network-settings
-      if (isSocks && !this.attribution.playwright.options.socksProxyPort) {
+      if (isSocks && !options.socksProxyPort) {
         // https://www.chromium.org/developers/design-documents/network-stack/socks-proxy
         chromeArguments.push(`--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE ${proxyURL.hostname}"`);
       }
       chromeArguments.push(`--proxy-server=${proxy.server}`);
       const proxyBypassRules = [];
       // https://source.chromium.org/chromium/chromium/src/+/master:net/docs/proxy.md;l=548;drc=71698e610121078e0d1a811054dcf9fd89b49578
-      if (this.attribution.playwright.options.socksProxyPort)
+      if (options.socksProxyPort)
         proxyBypassRules.push('<-loopback>');
       if (proxy.bypass)
         proxyBypassRules.push(...proxy.bypass.split(',').map(t => t.trim()).map(t => t.startsWith('.') ? '*' + t : t));
@@ -353,10 +349,8 @@ export class Chromium extends BrowserType {
     return chromeArguments;
   }
 
-  override readyState(options: types.LaunchOptions): BrowserReadyState | undefined {
-    if (options.cdpPort !== undefined || options.args?.some(a => a.startsWith('--remote-debugging-port')))
-      return new ChromiumReadyState();
-    return undefined;
+  override async waitForReadyState(options: types.LaunchOptions, browserLogsCollector: RecentLogsCollector): Promise<{ wsEndpoint?: string }> {
+    return waitForReadyState(options, browserLogsCollector);
   }
 
   override getExecutableName(options: types.LaunchOptions): string {
@@ -366,16 +360,21 @@ export class Chromium extends BrowserType {
   }
 }
 
-class ChromiumReadyState extends BrowserReadyState {
-  override onBrowserOutput(message: string): void {
+export async function waitForReadyState(options: types.LaunchOptions, browserLogsCollector: RecentLogsCollector): Promise<{ wsEndpoint?: string }> {
+  if (options.cdpPort === undefined && !options.args?.some(a => a.startsWith('--remote-debugging-port')))
+    return {};
+
+  const result = new ManualPromise<{ wsEndpoint?: string }>();
+  browserLogsCollector.onMessage(message => {
     if (message.includes('Failed to create a ProcessSingleton for your profile directory.')) {
-      this._wsEndpoint.reject(new Error('Failed to create a ProcessSingleton for your profile directory. ' +
+      result.reject(new Error('Failed to create a ProcessSingleton for your profile directory. ' +
         'This usually means that the profile is already in use by another instance of Chromium.'));
     }
     const match = message.match(/DevTools listening on (.*)/);
     if (match)
-      this._wsEndpoint.resolve(match[1]);
-  }
+      result.resolve({ wsEndpoint: match[1] });
+  });
+  return result;
 }
 
 async function urlToWSEndpoint(progress: Progress, endpointURL: string, headers: { [key: string]: string; }) {
@@ -383,12 +382,15 @@ async function urlToWSEndpoint(progress: Progress, endpointURL: string, headers:
     return endpointURL;
   progress.log(`<ws preparing> retrieving websocket url from ${endpointURL}`);
   const url = new URL(endpointURL);
+  if (!url.pathname.endsWith('/'))
+    url.pathname = url.pathname + '/';
   url.pathname += 'json/version/';
   const httpURL = url.toString();
 
   const json = await fetchData({
     url: httpURL,
     headers,
+    timeout: progress.timeUntilDeadline(),
   }, async (_, resp) => new Error(`Unexpected status ${resp.statusCode} when connecting to ${httpURL}.\n` +
     `This does not look like a DevTools server, try connecting via ws://.`)
   );

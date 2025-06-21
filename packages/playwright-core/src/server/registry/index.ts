@@ -384,7 +384,9 @@ const DOWNLOAD_PATHS: Record<BrowserName | InternalTool, DownloadPaths> = {
     'win64': 'builds/android/%s/android.zip',
   },
   // TODO(bidi): implement downloads.
-  'bidi': {
+  '_bidiFirefox': {
+  } as DownloadPaths,
+  '_bidiChromium': {
   } as DownloadPaths,
 };
 
@@ -449,11 +451,11 @@ type BrowsersJSONDescriptor = {
   dir: string,
 };
 
-type BrowsersInfo = {
+export type BrowserInfo = {
   browserName: string,
   browserVersion: number,
-  hostDir: string,
   browserPath: string
+  referenceDir: string,
 };
 
 function readDescriptors(browsersJSON: BrowsersJSON): BrowsersJSONDescriptor[] {
@@ -480,7 +482,7 @@ function readDescriptors(browsersJSON: BrowsersJSON): BrowsersJSONDescriptor[] {
   });
 }
 
-export type BrowserName = 'chromium' | 'firefox' | 'webkit' | 'bidi';
+export type BrowserName = 'chromium' | 'firefox' | 'webkit' | '_bidiFirefox' | '_bidiChromium';
 type InternalTool = 'ffmpeg' | 'winldd' | 'firefox-beta' | 'chromium-tip-of-tree' | 'chromium-headless-shell' | 'chromium-tip-of-tree-headless-shell' | 'android';
 type BidiChannel = 'moz-firefox' | 'moz-firefox-beta' | 'moz-firefox-nightly' | 'bidi-chrome-canary' | 'bidi-chrome-stable' | 'bidi-chromium';
 type ChromiumChannel = 'chrome' | 'chrome-beta' | 'chrome-dev' | 'chrome-canary' | 'msedge' | 'msedge-beta' | 'msedge-dev' | 'msedge-canary';
@@ -717,8 +719,8 @@ export class Registry {
     }));
     this._executables.push({
       type: 'browser',
-      name: 'bidi-chromium',
-      browserName: 'bidi',
+      name: '_bidiChromium',
+      browserName: '_bidiChromium',
       directory: chromium.dir,
       executablePath: () => chromiumExecutable,
       executablePathOrDie: (sdkLanguage: string) => executablePathOrDie('chromium', chromiumExecutable, chromium.installByDefault, sdkLanguage),
@@ -842,21 +844,6 @@ export class Registry {
       _dependencyGroup: 'tools',
       _isHermeticInstallation: true,
     });
-
-    this._executables.push({
-      type: 'browser',
-      name: 'bidi',
-      browserName: 'bidi',
-      directory: undefined,
-      executablePath: () => undefined,
-      executablePathOrDie: () => '',
-      installType: 'none',
-      _validateHostRequirements: () => Promise.resolve(),
-      downloadURLs: [],
-      _install: () => Promise.resolve(),
-      _dependencyGroup: 'tools',
-      _isHermeticInstallation: true,
-    });
   }
 
   private _createChromiumChannel(name: ChromiumChannel, lookAt: Record<'linux' | 'darwin' | 'win32', string>, install?: () => Promise<void>): ExecutableImpl {
@@ -931,7 +918,7 @@ export class Registry {
     return {
       type: 'channel',
       name,
-      browserName: 'bidi',
+      browserName: '_bidiFirefox',
       directory: undefined,
       executablePath: (sdkLanguage: string) => executablePath(sdkLanguage, false),
       executablePathOrDie: (sdkLanguage: string) => executablePath(sdkLanguage, true)!,
@@ -947,7 +934,7 @@ export class Registry {
       const suffix = lookAt[process.platform as 'linux' | 'darwin' | 'win32'];
       if (!suffix) {
         if (shouldThrow)
-          throw new Error(`Firefox distribution '${name}' is not supported on ${process.platform}`);
+          throw new Error(`Chromium distribution '${name}' is not supported on ${process.platform}`);
         return undefined;
       }
       const prefixes = (process.platform === 'win32' ? [
@@ -974,7 +961,7 @@ export class Registry {
     return {
       type: 'channel',
       name,
-      browserName: 'bidi',
+      browserName: '_bidiChromium',
       directory: undefined,
       executablePath: (sdkLanguage: string) => executablePath(sdkLanguage, false),
       executablePathOrDie: (sdkLanguage: string) => executablePath(sdkLanguage, true)!,
@@ -1050,9 +1037,8 @@ export class Registry {
       await fs.promises.writeFile(path.join(linksDir, calculateSha1(PACKAGE_PATH)), PACKAGE_PATH);
 
       // Remove stale browsers.
-      const [browsers, brokenLinks] = await this._traverseBrowserInstallations(linksDir);
-      await this._deleteStaleBrowsers(browsers);
-      await this._deleteBrokenInstallations(brokenLinks);
+      if (!getAsBooleanFromENV('PLAYWRIGHT_SKIP_BROWSER_GC'))
+        await this._validateInstallationCache(linksDir);
 
       // Install browsers for this package.
       for (const executable of executables) {
@@ -1117,9 +1103,7 @@ export class Registry {
     }
 
     // Remove stale browsers.
-    const [browsers, brokenLinks] = await this._traverseBrowserInstallations(linksDir);
-    await this._deleteStaleBrowsers(browsers);
-    await this._deleteBrokenInstallations(brokenLinks);
+    await this._validateInstallationCache(linksDir);
 
     return {
       numberOfBrowsersLeft: (await fs.promises.readdir(registryDirectory).catch(() => [])).filter(browserDirectory => isBrowserDirectory(browserDirectory)).length
@@ -1260,25 +1244,20 @@ export class Registry {
     }
   }
 
-  async list() {
+  async listInstalledBrowsers() {
     const linksDir = path.join(registryDirectory, '.links');
-    const [browsers] = await this._traverseBrowserInstallations(linksDir);
-
-    // Group browsers by browserName
-    const groupedBrowsers: Record<string, BrowsersInfo[]> = {};
-
-    for (const browser of browsers) {
-      if (!groupedBrowsers[browser.browserName])
-        groupedBrowsers[browser.browserName] = [];
-
-      groupedBrowsers[browser.browserName].push(browser);
-    }
-
-    return groupedBrowsers;
+    const { browsers } = await this._traverseBrowserInstallations(linksDir);
+    return browsers.filter(browser => fs.existsSync(browser.browserPath));
   }
 
-  private async _traverseBrowserInstallations(linksDir: string): Promise<[browsers: BrowsersInfo[], brokenLinks: string[]]> {
-    const browserList: BrowsersInfo[] = [];
+  private async _validateInstallationCache(linksDir: string) {
+    const { browsers, brokenLinks } = await this._traverseBrowserInstallations(linksDir);
+    await this._deleteStaleBrowsers(browsers);
+    await this._deleteBrokenInstallations(brokenLinks);
+  }
+
+  private async _traverseBrowserInstallations(linksDir: string): Promise<{ browsers: BrowserInfo[], brokenLinks: string[] }> {
+    const browserList: BrowserInfo[] = [];
     const brokenLinks: string[] = [];
     for (const fileName of await fs.promises.readdir(linksDir)) {
       const linkPath = path.join(linksDir, fileName);
@@ -1302,8 +1281,8 @@ export class Registry {
           browserList.push({
             browserName,
             browserVersion,
-            hostDir: linkTarget,
-            browserPath
+            browserPath,
+            referenceDir: linkTarget,
           });
         }
       } catch (e) {
@@ -1311,13 +1290,10 @@ export class Registry {
       }
     }
 
-    return [browserList, brokenLinks];
+    return { browsers: browserList, brokenLinks };
   }
 
-  private async _deleteStaleBrowsers(browserList: BrowsersInfo[]) {
-    if (getAsBooleanFromENV('PLAYWRIGHT_SKIP_BROWSER_GC'))
-      return;
-
+  private async _deleteStaleBrowsers(browserList: BrowserInfo[]) {
     const usedBrowserPaths: Set<string> = new Set();
     for (const browser of browserList) {
       const { browserName, browserVersion, browserPath } = browser;

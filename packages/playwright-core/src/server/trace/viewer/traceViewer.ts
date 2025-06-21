@@ -169,7 +169,6 @@ export async function openTraceViewerApp(url: string, browserName: string, optio
   const traceViewerBrowser = isUnderTest() ? 'chromium' : browserName;
 
   const { context, page } = await launchApp(traceViewerPlaywright[traceViewerBrowser as 'chromium'], {
-    // TODO: store language in the trace.
     sdkLanguage: traceViewerPlaywright.options.sdkLanguage,
     windowSize: { width: 1280, height: 800 },
     persistentContextOptions: {
@@ -181,7 +180,7 @@ export async function openTraceViewerApp(url: string, browserName: string, optio
     },
   });
 
-  const controller = new ProgressController(serverSideCallMetadata(), context._browser);
+  const controller = new ProgressController(serverSideCallMetadata(), context._browser, 'strict');
   await controller.run(async progress => {
     await context._browser._defaultContext!._loadDefaultContextAsIs(progress);
   });

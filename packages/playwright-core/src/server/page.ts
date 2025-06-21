@@ -94,7 +94,7 @@ export interface PageDelegate {
   // Work around for asynchronously dispatched CSP errors in Firefox.
   readonly cspErrorsAsynchronousForInlineScripts?: boolean;
   // Work around for mouse position in Firefox.
-  resetForReuse(): Promise<void>;
+  resetForReuse(progress: Progress): Promise<void>;
   // WebKit hack.
   shouldToggleStyleSheetToSyncAnimations(): boolean;
 }
@@ -151,7 +151,7 @@ export class Page extends SdkObject {
   private _emulatedSize: EmulatedSize | undefined;
   private _extraHTTPHeaders: types.HeadersArray | undefined;
   private _emulatedMedia: Partial<EmulatedMedia> = {};
-  private _interceptFileChooser = false;
+  private _fileChooserInterceptedBy = new Set<any>();
   private readonly _pageBindings = new Map<string, PageBinding>();
   initScripts: InitScript[] = [];
   readonly screenshotter: Screenshotter;
@@ -160,8 +160,7 @@ export class Page extends SdkObject {
   private _workers = new Map<string, Worker>();
   readonly pdf: ((options: channels.PagePdfParams) => Promise<Buffer>) | undefined;
   readonly coverage: any;
-  clientRequestInterceptor: network.RouteHandler | undefined;
-  serverRequestInterceptor: network.RouteHandler | undefined;
+  readonly requestInterceptors: network.RouteHandler[] = [];
   video: Artifact | null = null;
   private _opener: Page | undefined;
   private _isServerSideOnly = false;
@@ -181,7 +180,7 @@ export class Page extends SdkObject {
     this.delegate = delegate;
     this.browserContext = browserContext;
     this.accessibility = new accessibility.Accessibility(delegate.getAccessibilityTree.bind(delegate));
-    this.keyboard = new input.Keyboard(delegate.rawKeyboard);
+    this.keyboard = new input.Keyboard(delegate.rawKeyboard, this);
     this.mouse = new input.Mouse(delegate.rawMouse, this);
     this.touchscreen = new input.Touchscreen(delegate.rawTouchscreen, this);
     this.screenshotter = new Screenshotter(this);
@@ -255,27 +254,22 @@ export class Page extends SdkObject {
       this._eventsToEmitAfterInitialized.push({ event, args });
   }
 
-  async resetForReuse(metadata: CallMetadata) {
+  async resetForReuse(progress: Progress) {
     this._locatorHandlers.clear();
 
-    await this.setClientRequestInterceptor(undefined);
-    await this.setServerRequestInterceptor(undefined);
-    await this.setFileChooserIntercepted(false);
     // Re-navigate once init scripts are gone.
     // TODO: we should have a timeout for `resetForReuse`.
-    await this.mainFrame().goto(metadata, 'about:blank', { timeout: 0 });
+    await this.mainFrame().gotoImpl(progress, 'about:blank', {});
     this._emulatedSize = undefined;
     this._emulatedMedia = {};
     this._extraHTTPHeaders = undefined;
-    this._interceptFileChooser = false;
 
     await Promise.all([
       this.delegate.updateEmulatedViewportSize(),
       this.delegate.updateEmulateMedia(),
-      this.delegate.updateFileChooserInterception(),
     ]);
 
-    await this.delegate.resetForReuse();
+    await this.delegate.resetForReuse(progress);
   }
 
   _didClose() {
@@ -374,22 +368,22 @@ export class Page extends SdkObject {
   }
 
   async reload(metadata: CallMetadata, options: types.NavigateOptions): Promise<network.Response | null> {
-    const controller = new ProgressController(metadata, this);
-    return controller.run(progress => this.mainFrame().raceNavigationAction(progress, options, async () => {
+    const controller = new ProgressController(metadata, this, 'strict');
+    return controller.run(progress => this.mainFrame().raceNavigationAction(progress, async () => {
       // Note: waitForNavigation may fail before we get response to reload(),
       // so we should await it immediately.
       const [response] = await Promise.all([
         // Reload must be a new document, and should not be confused with a stray pushState.
         this.mainFrame()._waitForNavigation(progress, true /* requiresNewDocument */, options),
-        this.delegate.reload(),
+        progress.race(this.delegate.reload()),
       ]);
       return response;
     }), options.timeout);
   }
 
   async goBack(metadata: CallMetadata, options: types.NavigateOptions): Promise<network.Response | null> {
-    const controller = new ProgressController(metadata, this);
-    return controller.run(progress => this.mainFrame().raceNavigationAction(progress, options, async () => {
+    const controller = new ProgressController(metadata, this, 'strict');
+    return controller.run(progress => this.mainFrame().raceNavigationAction(progress, async () => {
       // Note: waitForNavigation may fail before we get response to goBack,
       // so we should catch it immediately.
       let error: Error | undefined;
@@ -397,9 +391,11 @@ export class Page extends SdkObject {
         error = e;
         return null;
       });
-      const result = await this.delegate.goBack();
-      if (!result)
+      const result = await progress.race(this.delegate.goBack());
+      if (!result) {
+        waitPromise.catch(() => {}); // Avoid an unhandled rejection.
         return null;
+      }
       const response = await waitPromise;
       if (error)
         throw error;
@@ -408,8 +404,8 @@ export class Page extends SdkObject {
   }
 
   async goForward(metadata: CallMetadata, options: types.NavigateOptions): Promise<network.Response | null> {
-    const controller = new ProgressController(metadata, this);
-    return controller.run(progress => this.mainFrame().raceNavigationAction(progress, options, async () => {
+    const controller = new ProgressController(metadata, this, 'strict');
+    return controller.run(progress => this.mainFrame().raceNavigationAction(progress, async () => {
       // Note: waitForNavigation may fail before we get response to goForward,
       // so we should catch it immediately.
       let error: Error | undefined;
@@ -417,9 +413,11 @@ export class Page extends SdkObject {
         error = e;
         return null;
       });
-      const result = await this.delegate.goForward();
-      if (!result)
+      const result = await progress.race(this.delegate.goForward());
+      if (!result) {
+        waitPromise.catch(() => {}); // Avoid an unhandled rejection.
         return null;
+      }
       const response = await waitPromise;
       if (error)
         throw error;
@@ -461,8 +459,6 @@ export class Page extends SdkObject {
   }
 
   private async _performWaitForNavigationCheck(progress: Progress) {
-    if (process.env.PLAYWRIGHT_SKIP_NAVIGATION_CHECK)
-      return;
     const mainFrame = this.frameManager.mainFrame();
     if (!mainFrame || !mainFrame.pendingDocument())
       return;
@@ -484,26 +480,24 @@ export class Page extends SdkObject {
       return;
     for (const [uid, handler] of this._locatorHandlers) {
       if (!handler.resolved) {
-        if (await this.mainFrame().isVisibleInternal(handler.selector, { strict: true })) {
+        if (await this.mainFrame().isVisibleInternal(progress, handler.selector, { strict: true })) {
           handler.resolved = new ManualPromise();
           this.emit(Page.Events.LocatorHandlerTriggered, uid);
         }
       }
       if (handler.resolved) {
         ++this._locatorHandlerRunningCounter;
-        progress.log(`  found ${asLocator(this.attribution.playwright.options.sdkLanguage, handler.selector)}, intercepting action to run the handler`);
+        progress.log(`  found ${asLocator(this.browserContext._browser.sdkLanguage(), handler.selector)}, intercepting action to run the handler`);
         const promise = handler.resolved.then(async () => {
           progress.throwIfAborted();
           if (!handler.noWaitAfter) {
-            progress.log(`  locator handler has finished, waiting for ${asLocator(this.attribution.playwright.options.sdkLanguage, handler.selector)} to be hidden`);
+            progress.log(`  locator handler has finished, waiting for ${asLocator(this.browserContext._browser.sdkLanguage(), handler.selector)} to be hidden`);
             await this.mainFrame().waitForSelectorInternal(progress, handler.selector, false, { state: 'hidden' });
           } else {
             progress.log(`  locator handler has finished`);
           }
         });
-        await this.openScope.race(promise).finally(() => --this._locatorHandlerRunningCounter);
-        // Avoid side-effects after long-running operation.
-        progress.throwIfAborted();
+        await progress.race(this.openScope.race(promise)).finally(() => --this._locatorHandlerRunningCounter);
         progress.log(`  interception handler has finished, continuing`);
       }
     }
@@ -574,16 +568,23 @@ export class Page extends SdkObject {
   }
 
   needsRequestInterception(): boolean {
-    return !!this.clientRequestInterceptor || !!this.serverRequestInterceptor || !!this.browserContext._requestInterceptor;
+    return this.requestInterceptors.length > 0 || this.browserContext.requestInterceptors.length > 0;
   }
 
-  async setClientRequestInterceptor(handler: network.RouteHandler | undefined): Promise<void> {
-    this.clientRequestInterceptor = handler;
+  async addRequestInterceptor(handler: network.RouteHandler, prepend?: 'prepend'): Promise<void> {
+    if (prepend)
+      this.requestInterceptors.unshift(handler);
+    else
+      this.requestInterceptors.push(handler);
     await this.delegate.updateRequestInterception();
   }
 
-  async setServerRequestInterceptor(handler: network.RouteHandler | undefined): Promise<void> {
-    this.serverRequestInterceptor = handler;
+  async removeRequestInterceptor(handler: network.RouteHandler): Promise<void> {
+    const index = this.requestInterceptors.indexOf(handler);
+    if (index === -1)
+      return;
+    this.requestInterceptors.splice(index, 1);
+    await this.browserContext.notifyRoutesInFlightAboutRemovedHandler(handler);
     await this.delegate.updateRequestInterception();
   }
 
@@ -593,12 +594,12 @@ export class Page extends SdkObject {
       return await locator.frame.rafrafTimeoutScreenshotElementWithProgress(progress, locator.selector, timeout, options || {});
     } : async (progress: Progress, timeout: number) => {
       await this.performActionPreChecks(progress);
-      await this.mainFrame().rafrafTimeout(timeout);
+      await this.mainFrame().rafrafTimeout(progress, timeout);
       return await this.screenshotter.screenshotPage(progress, options || {});
     };
 
     const comparator = getComparator('image/png');
-    const controller = new ProgressController(metadata, this);
+    const controller = new ProgressController(metadata, this, 'strict');
     if (!options.expected && options.isNot)
       return { errorMessage: '"not" matcher requires expected result' };
     try {
@@ -634,7 +635,6 @@ export class Page extends SdkObject {
         progress.log(`  generating new stable screenshot expectation`);
       let isFirstIteration = true;
       while (true) {
-        progress.throwIfAborted();
         if (this.isClosed())
           throw new Error('The page has closed');
         const screenshotTimeout = pollIntervals.shift() ?? 1000;
@@ -642,6 +642,8 @@ export class Page extends SdkObject {
           progress.log(`waiting ${screenshotTimeout}ms before taking screenshot`);
         previous = actual;
         actual = await rafrafScreenshot(progress, screenshotTimeout).catch(e => {
+          if (this.mainFrame().isNonRetriableError(e))
+            throw e;
           progress.log(`failed to take screenshot - ` + e.message);
           return undefined;
         });
@@ -673,7 +675,7 @@ export class Page extends SdkObject {
       }
       throw new Error(intermediateResult!.errorMessage);
     }, callTimeout).catch(e => {
-      // Q: Why not throw upon isSessionClosedError(e) as in other places?
+      // Q: Why not throw upon isNonRetriableError(e) as in other places?
       // A: We want user to receive a friendly diff between actual and expected/previous.
       if (js.isJavaScriptErrorInEvaluate(e) || isInvalidSelectorError(e))
         throw e;
@@ -696,7 +698,7 @@ export class Page extends SdkObject {
         options.timeout);
   }
 
-  async close(metadata: CallMetadata, options: { runBeforeUnload?: boolean, reason?: string } = {}) {
+  async close(options: { runBeforeUnload?: boolean, reason?: string } = {}) {
     if (this._closedState === 'closed')
       return;
     if (options.reason)
@@ -744,13 +746,18 @@ export class Page extends SdkObject {
     }
   }
 
-  async setFileChooserIntercepted(enabled: boolean): Promise<void> {
-    this._interceptFileChooser = enabled;
-    await this.delegate.updateFileChooserInterception();
+  async setFileChooserInterceptedBy(enabled: boolean, by: any): Promise<void> {
+    const wasIntercepted = this.fileChooserIntercepted();
+    if (enabled)
+      this._fileChooserInterceptedBy.add(by);
+    else
+      this._fileChooserInterceptedBy.delete(by);
+    if (wasIntercepted !== this.fileChooserIntercepted())
+      await this.delegate.updateFileChooserInterception();
   }
 
   fileChooserIntercepted() {
-    return this._interceptFileChooser;
+    return this._fileChooserInterceptedBy.size > 0;
   }
 
   frameNavigatedToNewDocument(frame: frames.Frame) {
@@ -804,10 +811,13 @@ export class Page extends SdkObject {
     this._isServerSideOnly = true;
   }
 
-  async snapshotForAI(metadata: CallMetadata): Promise<string> {
-    this.lastSnapshotFrameIds = [];
-    const snapshot = await snapshotFrameForAI(this.mainFrame(), 0, this.lastSnapshotFrameIds);
-    return snapshot.join('\n');
+  snapshotForAI(metadata: CallMetadata): Promise<string> {
+    const controller = new ProgressController(metadata, this, 'strict');
+    return controller.run(async progress => {
+      this.lastSnapshotFrameIds = [];
+      const snapshot = await snapshotFrameForAI(progress, this.mainFrame(), 0, this.lastSnapshotFrameIds);
+      return snapshot.join('\n');
+    });
   }
 }
 
@@ -908,7 +918,6 @@ export class PageBinding {
 export class InitScript {
   readonly source: string;
   readonly name?: string;
-  auxData: any; // Can be arbitrarily used by a browser-specific implementation.
 
   constructor(source: string, name?: string) {
     this.source = `(() => {
@@ -984,12 +993,27 @@ class FrameThrottler {
   }
 }
 
-async function snapshotFrameForAI(frame: frames.Frame, frameOrdinal: number, frameIds: string[]): Promise<string[]> {
-  const context = await frame._utilityContext();
-  const injectedScript = await context.injectedScript();
-  const snapshot = await injectedScript.evaluate((injected, refPrefix) => {
-    return injected.ariaSnapshot(injected.document.body, { forAI: true, refPrefix });
-  }, frameOrdinal ? 'f' + frameOrdinal : '');
+async function snapshotFrameForAI(progress: Progress, frame: frames.Frame, frameOrdinal: number, frameIds: string[]): Promise<string[]> {
+  // Only await the topmost navigations, inner frames will be empty when racing.
+  const snapshot = await frame.retryWithProgressAndTimeouts(progress, [1000, 2000, 4000, 8000], async continuePolling => {
+    try {
+      const context = await progress.race(frame._utilityContext());
+      const injectedScript = await progress.race(context.injectedScript());
+      const snapshotOrRetry = await progress.race(injectedScript.evaluate((injected, refPrefix) => {
+        const node = injected.document.body;
+        if (!node)
+          return true;
+        return injected.ariaSnapshot(node, { forAI: true, refPrefix });
+      }, frameOrdinal ? 'f' + frameOrdinal : ''));
+      if (snapshotOrRetry === true)
+        return continuePolling;
+      return snapshotOrRetry;
+    } catch (e) {
+      if (frame.isNonRetriableError(e))
+        throw e;
+      return continuePolling;
+    }
+  });
 
   const lines = snapshot.split('\n');
   const result = [];
@@ -1004,7 +1028,7 @@ async function snapshotFrameForAI(frame: frames.Frame, frameOrdinal: number, fra
     const ref = match[2];
     const frameSelector = `aria-ref=${ref} >> internal:control=enter-frame`;
     const frameBodySelector = `${frameSelector} >> body`;
-    const child = await frame.selectors.resolveFrameForSelector(frameBodySelector, { strict: true });
+    const child = await progress.race(frame.selectors.resolveFrameForSelector(frameBodySelector, { strict: true }));
     if (!child) {
       result.push(line);
       continue;
@@ -1012,7 +1036,7 @@ async function snapshotFrameForAI(frame: frames.Frame, frameOrdinal: number, fra
     const frameOrdinal = frameIds.length + 1;
     frameIds.push(child.frame._id);
     try {
-      const childSnapshot = await snapshotFrameForAI(child.frame, frameOrdinal, frameIds);
+      const childSnapshot = await snapshotFrameForAI(progress, child.frame, frameOrdinal, frameIds);
       result.push(line + ':', ...childSnapshot.map(l => leadingSpace + '  ' + l));
     } catch {
       result.push(line);
