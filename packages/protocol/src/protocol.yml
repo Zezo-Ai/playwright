@@ -223,6 +223,8 @@ SetNetworkCookie:
       - Strict
       - Lax
       - None
+    partitionKey: string?
+    _crHasCrossSiteAncestor: boolean?
 
 
 NetworkCookie:
@@ -241,6 +243,8 @@ NetworkCookie:
       - Strict
       - Lax
       - None
+    partitionKey: string?
+    _crHasCrossSiteAncestor: boolean?
 
 
 NameValue:
@@ -362,7 +366,7 @@ APIRequestContext:
   commands:
 
     fetch:
-      title: Fetch "{url}"
+      title: '{method} "{url}"'
       parameters:
         url: string
         encodedParams: string?
@@ -782,13 +786,14 @@ Root:
 
 Playwright:
   type: interface
+  progress: true
 
   initializer:
     chromium: BrowserType
     firefox: BrowserType
     webkit: BrowserType
-    bidiChromium: BrowserType
-    bidiFirefox: BrowserType
+    _bidiChromium: BrowserType
+    _bidiFirefox: BrowserType
     android: Android
     electron: Electron
     utils: LocalUtils?
@@ -959,6 +964,7 @@ DebugController:
 
 SocksSupport:
   type: interface
+  progress: true
 
   commands:
     socksConnected:
@@ -1192,6 +1198,7 @@ EventTarget:
 
 BrowserContext:
   type: interface
+  progress: true
 
   extends: EventTarget
 
@@ -1359,6 +1366,11 @@ BrowserContext:
           literals:
           - inspecting
           - recording
+        recorderMode:
+          type: enum?
+          literals:
+          - record
+          - perform
         pauseOnNextStatement: boolean?
         testIdAttributeName: string?
         launchOptions: json?
@@ -1534,6 +1546,7 @@ BrowserContext:
 
 Page:
   type: interface
+  progress: true
 
   extends: EventTarget
 
@@ -2044,6 +2057,7 @@ Page:
 
 Frame:
   type: interface
+  progress: true
 
   initializer:
     url: string
@@ -2285,6 +2299,13 @@ Frame:
       returns:
         element: ElementHandle
 
+    generateLocatorString:
+      internal: true
+      parameters:
+        selector: string
+      returns:
+        value: string?
+
     highlight:
       internal: true
       parameters:
@@ -2408,6 +2429,7 @@ Frame:
     isHidden:
       title: Is hidden
       parameters:
+        # Note: compared to other isFoo methods, isHidden is a one-shot operation without a timeout.
         selector: string
         strict: boolean?
       returns:
@@ -2418,6 +2440,7 @@ Frame:
     isVisible:
       title: Is visible
       parameters:
+        # Note: compared to other isFoo methods, isVisible is a one-shot operation without a timeout.
         selector: string
         strict: boolean?
       returns:
@@ -2655,7 +2678,7 @@ Frame:
     expect:
       title: Expect "{expression}"
       parameters:
-        selector: string
+        selector: string?
         expression: string
         expressionArg: json?
         expectedText:
@@ -2697,6 +2720,7 @@ Frame:
 
 Worker:
   type: interface
+  progress: true
 
   initializer:
     url: string
@@ -2728,6 +2752,7 @@ Worker:
 
 JSHandle:
   type: interface
+  progress: true
 
   initializer:
     preview: string
@@ -2791,6 +2816,7 @@ JSHandle:
 
 ElementHandle:
   type: interface
+  progress: true
 
   extends: JSHandle
 
@@ -2932,11 +2958,6 @@ ElementHandle:
       flags:
         slowMo: true
         snapshot: true
-
-    generateLocatorString:
-      internal: true
-      returns:
-        value: string?
 
     getAttribute:
       internal: true
@@ -3314,6 +3335,7 @@ Route:
 
 WebSocketRoute:
   type: interface
+  progress: true
 
   initializer:
     url: string
@@ -3489,6 +3511,7 @@ WebSocket:
 
 BindingCall:
   type: interface
+  progress: true
 
   initializer:
     frame: Frame
@@ -3514,6 +3537,7 @@ BindingCall:
 
 Dialog:
   type: interface
+  progress: true
 
   initializer:
     page: Page?
@@ -3533,6 +3557,7 @@ Dialog:
 
 Tracing:
   type: interface
+  progress: true
 
   commands:
 
@@ -3632,6 +3657,7 @@ Artifact:
 
 Stream:
   type: interface
+  progress: true
 
   commands:
 
@@ -3648,6 +3674,7 @@ Stream:
 
 WritableStream:
   type: interface
+  progress: true
 
   commands:
 
@@ -3662,6 +3689,7 @@ WritableStream:
 
 CDPSession:
   type: interface
+  progress: true
 
   commands:
 
@@ -4120,6 +4148,7 @@ AndroidElementInfo:
 
 JsonPipe:
   type: interface
+  progress: true
 
   commands:
     send:

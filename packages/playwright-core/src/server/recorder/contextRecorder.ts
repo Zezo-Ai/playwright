@@ -16,7 +16,7 @@
 
 import { EventEmitter } from 'events';
 
-import { RecorderCollection } from './recorderCollection';
+import { RecorderSignalProcessor } from './recorderSignalProcessor';
 import * as rawRecorderSource from '../../generated/pollingRecorderSource';
 import { eventsHelper, monotonicTime, quoteCSSAttributeValue  } from '../../utils';
 import { raceAgainstDeadline } from '../../utils/isomorphic/timeoutRunner';
@@ -26,12 +26,16 @@ import { Frame } from '../frames';
 import { Page } from '../page';
 import { ThrottledFile } from './throttledFile';
 import { generateCode } from '../codegen/language';
+import { performAction } from './recorderRunner';
+import { collapseActions } from './recorderUtils';
 
 import type { RegisteredListener } from '../../utils';
 import type { Language, LanguageGenerator, LanguageGeneratorOptions } from '../codegen/types';
 import type * as channels from '@protocol/channels';
 import type * as actions from '@recorder/actions';
 import type { Source } from '@recorder/recorderTypes';
+import type { Progress } from '@protocol/progress';
+import type { Signal } from '../../../../recorder/src/actions';
 
 type BindingSource = { frame: Frame, page: Page };
 
@@ -44,7 +48,7 @@ export class ContextRecorder extends EventEmitter {
     Change: 'change'
   };
 
-  private _collection: RecorderCollection;
+  private _collection: RecorderSignalProcessor;
   private _pageAliases = new Map<Page, string>();
   private _lastPopupOrdinal = 0;
   private _lastDialogOrdinal = -1;
@@ -56,6 +60,9 @@ export class ContextRecorder extends EventEmitter {
   private _throttledOutputFile: ThrottledFile | null = null;
   private _orderedLanguages: LanguageGenerator[] = [];
   private _listeners: RegisteredListener[] = [];
+  private _actions: actions.ActionInContext[] = [];
+  private _languageGeneratorOptions: LanguageGeneratorOptions;
+  private _enabled: boolean = false;
 
   constructor(context: BrowserContext, params: channels.BrowserContextEnableRecorderParams, delegate: ContextRecorderDelegate) {
     super();
@@ -63,11 +70,10 @@ export class ContextRecorder extends EventEmitter {
     this._params = params;
     this._delegate = delegate;
     this._recorderSources = [];
-    const language = params.language || context.attribution.playwright.options.sdkLanguage;
-    this.setOutput(language, params.outputFile);
+    const language = params.language || context._browser.sdkLanguage();
 
     // Make a copy of options to modify them later.
-    const languageGeneratorOptions: LanguageGeneratorOptions = {
+    this._languageGeneratorOptions = {
       browserName: context._browser.options.name,
       launchOptions: { headless: false, ...params.launchOptions, tracesDir: undefined },
       contextOptions: { ...params.contextOptions },
@@ -75,40 +81,64 @@ export class ContextRecorder extends EventEmitter {
       saveStorage: params.saveStorage,
     };
 
-    this._collection = new RecorderCollection(this._pageAliases);
-    this._collection.on('change', (actions: actions.ActionInContext[]) => {
-      this._recorderSources = [];
-      for (const languageGenerator of this._orderedLanguages) {
-        const { header, footer, actionTexts, text } = generateCode(actions, languageGenerator, languageGeneratorOptions);
-        const source: Source = {
-          isRecorded: true,
-          label: languageGenerator.name,
-          group: languageGenerator.groupName,
-          id: languageGenerator.id,
-          text,
-          header,
-          footer,
-          actions: actionTexts,
-          language: languageGenerator.highlighter,
-          highlight: []
-        };
-        source.revealLine = text.split('\n').length - 1;
-        this._recorderSources.push(source);
-        if (languageGenerator === this._orderedLanguages[0])
-          this._throttledOutputFile?.setContent(source.text);
-      }
-      this.emit(ContextRecorder.Events.Change, {
-        sources: this._recorderSources,
-        actions
-      });
+    this._collection = new RecorderSignalProcessor();
+    this._collection.on('action', (actionInContext: actions.ActionInContext) => {
+      if (!this._enabled)
+        return;
+      this._actions.push(actionInContext);
+      this._updateActions();
     });
+    this._collection.on('signal', (signal: Signal) => {
+      if (!this._enabled)
+        return;
+      const lastAction = this._actions[this._actions.length - 1];
+      if (lastAction)
+        lastAction.action.signals.push(signal);
+      this._updateActions();
+    });
+
     context.on(BrowserContext.Events.BeforeClose, () => {
       this._throttledOutputFile?.flush();
     });
     this._listeners.push(eventsHelper.addEventListener(process, 'exit', () => {
       this._throttledOutputFile?.flush();
     }));
+
+    this.setOutput(language, params.outputFile);
     this.setEnabled(params.mode === 'recording');
+  }
+
+  private _resetActions() {
+    this._actions = [];
+    this._updateActions();
+  }
+
+  private _updateActions() {
+    const actions = collapseActions(this._actions);
+    this._recorderSources = [];
+    for (const languageGenerator of this._orderedLanguages) {
+      const { header, footer, actionTexts, text } = generateCode(actions, languageGenerator, this._languageGeneratorOptions);
+      const source: Source = {
+        isRecorded: true,
+        label: languageGenerator.name,
+        group: languageGenerator.groupName,
+        id: languageGenerator.id,
+        text,
+        header,
+        footer,
+        actions: actionTexts,
+        language: languageGenerator.highlighter,
+        highlight: []
+      };
+      source.revealLine = text.split('\n').length - 1;
+      this._recorderSources.push(source);
+      if (languageGenerator === this._orderedLanguages[0])
+        this._throttledOutputFile?.setContent(source.text);
+    }
+    this.emit(ContextRecorder.Events.Change, {
+      sources: this._recorderSources,
+      actions
+    });
   }
 
   setOutput(codegenId: string, outputFile?: string) {
@@ -119,7 +149,7 @@ export class ContextRecorder extends EventEmitter {
     languages.delete(primaryLanguage);
     this._orderedLanguages = [primaryLanguage, ...languages];
     this._throttledOutputFile = outputFile ? new ThrottledFile(outputFile) : null;
-    this._collection?.restart();
+    this._resetActions();
   }
 
   languageName(id?: string): Language {
@@ -130,7 +160,7 @@ export class ContextRecorder extends EventEmitter {
     return 'javascript';
   }
 
-  async install() {
+  async install(progress: Progress) {
     this._context.on(BrowserContext.Events.Page, (page: Page) => this._onPage(page));
     for (const page of this._context.pages())
       this._onPage(page);
@@ -142,18 +172,18 @@ export class ContextRecorder extends EventEmitter {
 
     // Input actions that potentially lead to navigation are intercepted on the page and are
     // performed by the Playwright.
-    await this._context.exposeBinding('__pw_recorderPerformAction', false,
+    await this._context.exposeBinding(progress, '__pw_recorderPerformAction', false,
         (source: BindingSource, action: actions.PerformOnRecordAction) => this._performAction(source.frame, action));
 
     // Other non-essential actions are simply being recorded.
-    await this._context.exposeBinding('__pw_recorderRecordAction', false,
+    await this._context.exposeBinding(progress, '__pw_recorderRecordAction', false,
         (source: BindingSource, action: actions.Action) => this._recordAction(source.frame, action));
 
     await this._context.extendInjectedScript(rawRecorderSource.source);
   }
 
   setEnabled(enabled: boolean) {
-    this._collection.setEnabled(enabled);
+    this._enabled = enabled;
   }
 
   dispose() {
@@ -164,7 +194,7 @@ export class ContextRecorder extends EventEmitter {
     // First page is called page, others are called popup1, popup2, etc.
     const frame = page.mainFrame();
     page.on('close', () => {
-      this._collection.addRecordedAction({
+      this._collection.addAction({
         frame: this._describeMainFrame(page),
         action: {
           name: 'closePage',
@@ -186,7 +216,7 @@ export class ContextRecorder extends EventEmitter {
     if (page.opener()) {
       this._onPopup(page.opener()!, page);
     } else {
-      this._collection.addRecordedAction({
+      this._collection.addAction({
         frame: this._describeMainFrame(page),
         action: {
           name: 'openPage',
@@ -199,7 +229,7 @@ export class ContextRecorder extends EventEmitter {
   }
 
   clearScript(): void {
-    this._collection.restart();
+    this._resetActions();
     if (this._params.mode === 'recording') {
       for (const page of this._context.pages())
         this._onFrameNavigated(page.mainFrame(), page);
@@ -241,11 +271,15 @@ export class ContextRecorder extends EventEmitter {
   }
 
   private async _performAction(frame: Frame, action: actions.PerformOnRecordAction) {
-    await this._collection.performAction(await this._createActionInContext(frame, action));
+    const actionInContext = await this._createActionInContext(frame, action);
+    this._collection.addAction(actionInContext);
+    if (actionInContext.action.name !== 'openPage' && actionInContext.action.name !== 'closePage')
+      await performAction(this._pageAliases, actionInContext);
+    actionInContext.endTime = monotonicTime();
   }
 
   private async _recordAction(frame: Frame, action: actions.Action) {
-    this._collection.addRecordedAction(await this._createActionInContext(frame, action));
+    this._collection.addAction(await this._createActionInContext(frame, action));
   }
 
   private _onFrameNavigated(frame: Frame, page: Page) {
