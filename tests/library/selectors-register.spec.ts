@@ -52,7 +52,9 @@ it('should work', async ({ playwright, browser }) => {
   await context.close();
 });
 
-it('should work when registered on global', async ({ browser }) => {
+it('should work when registered on global', async ({ browser, mode }) => {
+  it.skip(mode === 'driver', 'We expect registering selectors on the right Playwright instance.');
+
   await require('@playwright/test').selectors.register('oop-tag', `(${createTagSelector.toString()})()`);
 
   const context = await browser.newContext();
@@ -141,6 +143,11 @@ it('should handle errors', async ({ playwright, browser }) => {
   error = await playwright.selectors.register('css', createDummySelector).catch(e => e);
   expect(error.message).toBe('selectors.register: "css" is a predefined selector engine');
   await page.close();
+});
+
+it('should throw "already registered" error when registering', { annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/36467' } }, async ({ playwright }) => {
+  await playwright.selectors.register('alreadyRegistered', createTagSelector);
+  await expect(playwright.selectors.register('alreadyRegistered', createTagSelector)).rejects.toThrowError('selectors.register: "alreadyRegistered" selector engine has been already registered');
 });
 
 it('should not rely on engines working from the root', async ({ playwright, browser }) => {

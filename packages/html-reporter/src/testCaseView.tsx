@@ -20,7 +20,7 @@ import * as React from 'react';
 import { TabbedPane } from './tabbedPane';
 import { AutoChip } from './chip';
 import './common.css';
-import { Link, ProjectLink, SearchParamsContext, testResultHref } from './links';
+import { Link, ProjectLink, SearchParamsContext, testResultHref, TraceLink } from './links';
 import { statusIcon } from './statusIcon';
 import './testCaseView.css';
 import { TestResultView } from './testResultView';
@@ -29,14 +29,16 @@ import { hashStringToInt, msToString } from './utils';
 import { clsx } from '@web/uiUtils';
 import { CopyToClipboardContainer } from './copyToClipboard';
 import { HeaderView } from './headerView';
+import type { MetadataWithCommitInfo } from '@playwright/isomorphic/types';
 
 export const TestCaseView: React.FC<{
   projectNames: string[],
   test: TestCase,
+  testRunMetadata: MetadataWithCommitInfo | undefined,
   next: TestCaseSummary | undefined,
   prev: TestCaseSummary | undefined,
   run: number,
-}> = ({ projectNames, test, run, next, prev }) => {
+}> = ({ projectNames, test, testRunMetadata, run, next, prev }) => {
   const [selectedResultIndex, setSelectedResultIndex] = React.useState(run);
   const searchParams = React.useContext(SearchParamsContext);
 
@@ -54,13 +56,14 @@ export const TestCaseView: React.FC<{
         <div className={clsx(!next && 'hidden')}><Link href={testResultHref({ test: next }) + filterParam}>next »</Link></div>
       </>}
     />
-    <div className='hbox'>
+    <div className='hbox' style={{ lineHeight: '24px' }}>
       <div className='test-case-location'>
         <CopyToClipboardContainer value={`${test.location.file}:${test.location.line}`}>
           {test.location.file}:{test.location.line}
         </CopyToClipboardContainer>
       </div>
       <div style={{ flex: 'auto' }}></div>
+      <TraceLink test={test} trailingSeparator={true} />
       <div className='test-case-duration'>{msToString(test.duration)}</div>
     </div>
     {(!!test.projectName || labels) && <div className='test-case-project-labels-row'>
@@ -83,7 +86,7 @@ export const TestCaseView: React.FC<{
             {!!visibleAnnotations.length && <AutoChip header='Annotations' dataTestId='test-case-annotations'>
               {visibleAnnotations.map((annotation, index) => <TestCaseAnnotationView key={index} annotation={annotation} />)}
             </AutoChip>}
-            <TestResultView test={test!} result={result} />
+            <TestResultView test={test!} result={result} testRunMetadata={testRunMetadata} />
           </>;
         },
       })) || []} selectedTab={String(selectedResultIndex)} setSelectedTab={id => setSelectedResultIndex(+id)} />

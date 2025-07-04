@@ -209,6 +209,7 @@ export class BidiBrowserContext extends BrowserContext {
   declare readonly _browser: BidiBrowser;
   private _originToPermissions = new Map<string, string[]>();
   private _blockingPageCreations: Set<Promise<unknown>> = new Set();
+  private _initScriptIds = new Map<InitScript, string>();
 
   constructor(browser: BidiBrowser, browserContextId: string | undefined, options: types.BrowserContextOptions) {
     super(browser, options, browserContextId);
@@ -223,16 +224,7 @@ export class BidiBrowserContext extends BrowserContext {
     const promises: Promise<any>[] = [
       super._initialize(),
     ];
-    if (this._options.viewport) {
-      promises.push(this._browser._browserSession.send('browsingContext.setViewport', {
-        viewport: {
-          width: this._options.viewport.width,
-          height: this._options.viewport.height
-        },
-        devicePixelRatio: this._options.deviceScaleFactor || 1,
-        userContexts: [this._userContextId()],
-      }));
-    }
+    promises.push(this.doUpdateDefaultViewport());
     if (this._options.geolocation)
       promises.push(this.setGeolocation(this._options.geolocation));
     await Promise.all(promises);
@@ -350,13 +342,13 @@ export class BidiBrowserContext extends BrowserContext {
     });
   }
 
-  async setExtraHTTPHeaders(headers: types.HeadersArray): Promise<void> {
+  async doUpdateExtraHTTPHeaders(): Promise<void> {
   }
 
   async setUserAgent(userAgent: string | undefined): Promise<void> {
   }
 
-  async setOffline(offline: boolean): Promise<void> {
+  async doUpdateOffline(): Promise<void> {
   }
 
   async doSetHTTPCredentials(httpCredentials?: types.Credentials): Promise<void> {
@@ -371,14 +363,37 @@ export class BidiBrowserContext extends BrowserContext {
       functionDeclaration: `() => { return ${initScript.source} }`,
       userContexts: [this._browserContextId || 'default'],
     });
-    initScript.auxData = script;
+    this._initScriptIds.set(initScript, script);
   }
 
   async doRemoveInitScripts(initScripts: InitScript[]) {
-    await Promise.all(initScripts.map(script => this._browser._browserSession.send('script.removePreloadScript', { script: script.auxData })));
+    const ids: string[] = [];
+    for (const script of initScripts) {
+      const id = this._initScriptIds.get(script);
+      if (id)
+        ids.push(id);
+      this._initScriptIds.delete(script);
+    }
+    await Promise.all(ids.map(script => this._browser._browserSession.send('script.removePreloadScript', { script })));
   }
 
   async doUpdateRequestInterception(): Promise<void> {
+  }
+
+  override async doUpdateDefaultViewport() {
+    if (!this._options.viewport)
+      return;
+    await this._browser._browserSession.send('browsingContext.setViewport', {
+      viewport: {
+        width: this._options.viewport.width,
+        height: this._options.viewport.height
+      },
+      devicePixelRatio: this._options.deviceScaleFactor || 1,
+      userContexts: [this._userContextId()],
+    });
+  }
+
+  override async doUpdateDefaultEmulatedMedia() {
   }
 
   override async doExposePlaywrightBinding() {

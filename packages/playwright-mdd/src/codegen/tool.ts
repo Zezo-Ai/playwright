@@ -14,10 +14,15 @@
  * limitations under the License.
  */
 
-export const fixTestInstructions = `
-# Instructions
+import type { z } from 'zod';
+import type { Context } from './context';
+import type { ToolSchema } from '../loop';
 
-- Following Playwright test failed.
-- Explain why, be concise, respect Playwright best practices.
-- Provide a snippet of code with the fix, if possible.
-`.trimStart();
+export type Tool<Input extends z.Schema = z.Schema> = {
+  schema: ToolSchema<Input>;
+  handle: (context: Context, params: z.output<Input>) => Promise<{ content: string, code: string[] }>;
+};
+
+export function defineTool<Input extends z.Schema>(tool: Tool<Input>): Tool<Input> {
+  return tool;
+}

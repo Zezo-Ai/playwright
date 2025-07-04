@@ -22,7 +22,7 @@ export type BlobReporterOptions = { outputDir?: string, fileName?: string };
 export type ListReporterOptions = { printSteps?: boolean };
 export type JUnitReporterOptions = { outputFile?: string, stripANSIControlSequences?: boolean, includeProjectInTestName?: boolean };
 export type JsonReporterOptions = { outputFile?: string };
-export type HtmlReporterOptions = { outputFolder?: string, open?: 'always' | 'never' | 'on-failure', host?: string, port?: number, attachmentsBaseURL?: string, title?: string };
+export type HtmlReporterOptions = { outputFolder?: string, open?: 'always' | 'never' | 'on-failure', host?: string, port?: number, attachmentsBaseURL?: string, title?: string, snippets?: boolean };
 
 export type ReporterDescription = Readonly<
   ['blob'] | ['blob', BlobReporterOptions] |
@@ -4124,7 +4124,7 @@ export interface TestType<TestArgs extends {}, WorkerArgs extends {}> {
   /**
    * Skip a test. Playwright will not run the test past the `test.skip()` call.
    *
-   * Skipped tests are not supposed to be ever run. If you intent to fix the test, use
+   * Skipped tests are not supposed to be ever run. If you intend to fix the test, use
    * [test.fixme([title, details, body, condition, callback, description])](https://playwright.dev/docs/api/class-test#test-fixme)
    * instead.
    *
@@ -4205,7 +4205,7 @@ export interface TestType<TestArgs extends {}, WorkerArgs extends {}> {
   /**
    * Skip a test. Playwright will not run the test past the `test.skip()` call.
    *
-   * Skipped tests are not supposed to be ever run. If you intent to fix the test, use
+   * Skipped tests are not supposed to be ever run. If you intend to fix the test, use
    * [test.fixme([title, details, body, condition, callback, description])](https://playwright.dev/docs/api/class-test#test-fixme)
    * instead.
    *
@@ -4286,7 +4286,7 @@ export interface TestType<TestArgs extends {}, WorkerArgs extends {}> {
   /**
    * Skip a test. Playwright will not run the test past the `test.skip()` call.
    *
-   * Skipped tests are not supposed to be ever run. If you intent to fix the test, use
+   * Skipped tests are not supposed to be ever run. If you intend to fix the test, use
    * [test.fixme([title, details, body, condition, callback, description])](https://playwright.dev/docs/api/class-test#test-fixme)
    * instead.
    *
@@ -4367,7 +4367,7 @@ export interface TestType<TestArgs extends {}, WorkerArgs extends {}> {
   /**
    * Skip a test. Playwright will not run the test past the `test.skip()` call.
    *
-   * Skipped tests are not supposed to be ever run. If you intent to fix the test, use
+   * Skipped tests are not supposed to be ever run. If you intend to fix the test, use
    * [test.fixme([title, details, body, condition, callback, description])](https://playwright.dev/docs/api/class-test#test-fixme)
    * instead.
    *
@@ -4448,7 +4448,7 @@ export interface TestType<TestArgs extends {}, WorkerArgs extends {}> {
   /**
    * Skip a test. Playwright will not run the test past the `test.skip()` call.
    *
-   * Skipped tests are not supposed to be ever run. If you intent to fix the test, use
+   * Skipped tests are not supposed to be ever run. If you intend to fix the test, use
    * [test.fixme([title, details, body, condition, callback, description])](https://playwright.dev/docs/api/class-test#test-fixme)
    * instead.
    *

@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
-import { test, expect } from './inspectorTest';
+import { test, expect, matrixDescribe } from './inspectorTest';
 import * as url from 'url';
 import fs from 'fs';
 
-test.describe('cli codegen', () => {
+matrixDescribe<('record' | 'perform')>('cli codegen', ['record', 'perform'], recorderMode => {
   test.skip(({ mode }) => mode !== 'default');
+  test.use({ recorderMode });
 
   test('should contain open page', async ({ openRecorder }) => {
     const { recorder } = await openRecorder();
@@ -195,6 +196,7 @@ await page.GetByRole(AriaRole.Button, new() { Name = "Choose File" }).SetInputFi
   });
 
   test('should download files', async ({ openRecorder, server }) => {
+    test.skip(recorderMode === 'record', 'Navigation is dispatched concurrently (before click is recorded)');
     const { page, recorder } = await openRecorder();
 
     server.setRoute('/download', (req, res) => {
@@ -216,7 +218,7 @@ await page.GetByRole(AriaRole.Button, new() { Name = "Choose File" }).SetInputFi
       page.waitForEvent('download'),
       page.click('a')
     ]);
-    const sources = await recorder.waitForOutput('JavaScript', 'downloadPromise');
+    const sources = await recorder.waitForOutput('JavaScript', 'await downloadPromise');
 
     expect.soft(sources.get('JavaScript')!.text).toContain(`
   const downloadPromise = page.waitForEvent('download');
@@ -246,6 +248,7 @@ var download = await page.RunAndWaitForDownloadAsync(async () =>
   });
 
   test('should handle dialogs', async ({ openRecorder }) => {
+    test.skip(recorderMode === 'record', 'Navigation is dispatched concurrently (before click is recorded)');
     const { page, recorder } = await openRecorder();
 
     await recorder.setContentAndWait(`
@@ -310,6 +313,7 @@ await page.GetByRole(AriaRole.Button, new() { Name = "click me" }).ClickAsync();
   });
 
   test('should record open in a new tab with url', async ({ openRecorder, browserName }) => {
+    test.skip(recorderMode === 'record', 'Navigation is dispatched concurrently (before click is recorded)');
     const { page, recorder } = await openRecorder();
     await recorder.setContentAndWait(`<a href="about:blank?foo">link</a>`);
 
@@ -458,6 +462,9 @@ await page1.GotoAsync("about:blank?foo");`);
     const harFileName = testInfo.outputPath('har.har');
     const cli = runCLI([`--save-storage=${storageFileName}`, `--save-har=${harFileName}`]);
     await cli.waitFor(`import { test, expect } from '@playwright/test'`);
+    // Since our interrupt is non-graceful, we need to wait for the process to settle.
+    // This test should be fixed.
+    await new Promise(resolve => setTimeout(resolve, 2000));
     await cli.process.kill('SIGINT');
     const { exitCode, signal } = await cli.process.exited;
     if (exitCode !== null) {
